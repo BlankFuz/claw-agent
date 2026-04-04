@@ -1,0 +1,109 @@
+{
+  "name": "claw-agent",
+  "displayName": "Claw Agent",
+  "description": "Agentic AI Coding Assistant",
+  "version": "0.0.1",
+  "publisher": "claw-agent",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claw-agent.openChat",
+        "title": "Open Claw Agent",
+        "icon": "media/claw-icon.svg",
+        "category": "Claw Agent"
+      },
+      {
+        "command": "claw-agent.newChat",
+        "title": "New Chat",
+        "icon": "$(add)",
+        "category": "Claw Agent"
+      },
+      {
+        "command": "claw-agent.addToContext",
+        "title": "Add to Claw Agent",
+        "category": "Claw Agent"
+      },
+      {
+        "command": "claw-agent.addToContextAndAsk",
+        "title": "Ask Claw Agent about this",
+        "category": "Claw Agent"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "claw-agent.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claw-agent-sidebar",
+          "title": "Claw Agent",
+          "icon": "media/claw-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "claw-agent-sidebar": [
+        {
+          "type": "webview",
+          "id": "claw-agent.sidebarView",
+          "name": "Claw Agent",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "claw-agent.newChat",
+          "when": "view == claw-agent.sidebarView",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "claw-agent.addToContext",
+          "when": "editorHasSelection",
+          "group": "claw-agent@1"
+        },
+        {
+          "command": "claw-agent.addToContextAndAsk",
+          "when": "editorHasSelection",
+          "group": "claw-agent@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "18.x",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^6.4.1",
+    "@typescript-eslint/parser": "^6.4.1",
+    "eslint": "^8.47.0",
+    "typescript": "^5.1.6"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.81.0",
+    "openai": "^6.33.0"
+  }
+}

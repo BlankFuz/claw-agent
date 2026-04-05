@@ -48,7 +48,7 @@ var codeContexts = []; // { filePath, startLine, endLine, lang, code }
 
 // ── Slash command autocomplete ──
 const commandDropdown = $('command-dropdown');
-const SLASH_COMMANDS = [
+var SLASH_COMMANDS = [
     { cmd: '/commit', desc: 'Stage changes and commit', args: '[message]' },
     { cmd: '/push', desc: 'Push commits to remote', args: '[remote] [branch]' },
     { cmd: '/review', desc: 'Review recent changes for issues' },
@@ -59,8 +59,12 @@ const SLASH_COMMANDS = [
     { cmd: '/export', desc: 'Export conversation as JSON' },
     { cmd: '/import', desc: 'Import a saved conversation' },
     { cmd: '/git', desc: 'Refresh git status' },
+    { cmd: '/skill-create', desc: 'Create a new custom skill', args: '<name>' },
+    { cmd: '/skill-list', desc: 'List all available skills' },
+    { cmd: '/skill-delete', desc: 'Delete a custom skill', args: '<name>' },
     { cmd: '/help', desc: 'Show all commands' },
 ];
+var skillCommands = []; // populated from extension
 var cmdActive = false;
 var cmdSelectedIdx = 0;
 var cmdFiltered = [];
@@ -1033,6 +1037,20 @@ window.addEventListener('message', e => {
                 input.focus();
             }
             break;
+        case 'skillList':
+            if (msg.value && Array.isArray(msg.value)) {
+                skillCommands = msg.value;
+                // Remove old dynamic skill commands (keep /skill-create, /skill-list, /skill-delete)
+                var managementCmds = ['/skill-create', '/skill-list', '/skill-delete'];
+                SLASH_COMMANDS = SLASH_COMMANDS.filter(function(c) {
+                    return !c.cmd.startsWith('/skill-') || managementCmds.indexOf(c.cmd) !== -1;
+                });
+                // Add dynamic skill invocation commands
+                skillCommands.forEach(function(sc) {
+                    SLASH_COMMANDS.push({ cmd: sc.cmd, desc: sc.desc, args: sc.args || '<request>' });
+                });
+            }
+            break;
     }
 });
 
@@ -1261,12 +1279,47 @@ function send() {
                 renderFileChips();
                 return;
             }
-            case '/help':
+            case '/help': {
                 addUser(text);
-                addAssistant('**Available commands:**\n- **/style** `<description>` — CSS/styling expert mode\n- **/commit** `[message]` — Stage changes and commit\n- **/push** `[remote] [branch]` — Push commits to remote\n- **/review** — Review recent changes for bugs and issues\n- **/learn** — Spend a turn exploring the workspace for better context\n- **/compact** — Compress conversation history\n- **/clear** — Clear chat and start fresh\n- **/export** — Export conversation as JSON\n- **/import** — Import a saved conversation\n- **/git** — Refresh git status\n- **/help** — Show this help');
+                var helpText = '**Available commands:**\n- **/style** `<description>` — CSS/styling expert mode\n- **/commit** `[message]` — Stage changes and commit\n- **/push** `[remote] [branch]` — Push commits to remote\n- **/review** — Review recent changes for bugs and issues\n- **/learn** — Spend a turn exploring the workspace for better context\n- **/compact** — Compress conversation history\n- **/clear** — Clear chat and start fresh\n- **/export** — Export conversation as JSON\n- **/import** — Import a saved conversation\n- **/git** — Refresh git status\n\n**Skill Management:**\n- **/skill-create** `<name> <description>` — Create a new custom skill\n- **/skill-list** — List all available skills (built-in + custom)\n- **/skill-delete** `<name>` — Delete a custom skill\n- **/help** — Show this help';
+                if (skillCommands.length > 0) {
+                    helpText += '\n\n**Skills:**';
+                    skillCommands.forEach(function(sc) {
+                        helpText += '\n- **' + sc.cmd + '** `' + (sc.args || '<request>') + '` — ' + sc.desc;
+                    });
+                }
+                addAssistant(helpText);
                 input.value = '';
                 input.style.height = 'auto';
                 return;
+            }
+            default:
+                // Handle /skill-* commands dynamically
+                if (cmd.startsWith('/skill-')) {
+                    addUser(text);
+                    setRunning(true);
+                    vscode.postMessage({
+                        type: 'askAgent',
+                        value: {
+                            provider: providerSelect.value,
+                            apiKey: apiKeyInput.value,
+                            prompt: text,
+                            baseUrl: baseUrlInput.value.trim() || undefined,
+                            model: getSelectedModel() || undefined,
+                            images: pendingImages.length > 0 ? pendingImages.map(function(im) { return { data: im.data, mediaType: im.mediaType }; }) : undefined,
+                            fileAttachments: attachedFiles.length > 0 ? attachedFiles.slice() : undefined,
+                        }
+                    });
+                    input.value = '';
+                    input.style.height = 'auto';
+                    pendingImages = [];
+                    renderImagePreviews();
+                    attachedFiles = [];
+                    codeContexts = [];
+                    renderFileChips();
+                    return;
+                }
+                break;
         }
     }
 
@@ -1327,3 +1380,5 @@ cancelBtn.addEventListener('click', () => {
 vscode.postMessage({ type: 'webviewReady' });
 // Request initial git status
 vscode.postMessage({ type: 'refreshGit' });
+// Request available skills
+vscode.postMessage({ type: 'fetchSkills' });

@@ -4,6 +4,7 @@ import { assembleToolPool, ToolPool } from "./tools/index";
 import { CostTracker } from "./costTracker";
 import { permissionsFullAccess } from "./permissions";
 import { SessionStore } from "./sessionStore";
+import { SkillManager } from "./skillManager";
 
 const HARNESS_CONFIG = {
     maxTurns: 32,
@@ -83,6 +84,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     _costTracker = new CostTracker();
     _sessionStore: SessionStore;
     _toolPool: ToolPool;
+    _skillManager: SkillManager;
+    _skillWatcher: vscode.Disposable | null = null;
     _abortController: AbortController | null = null;
     _thinkingEnabled = true;
     _autoApprove = false;
@@ -96,6 +99,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     ) {
         this._sessionStore = new SessionStore(_globalState);
         this._toolPool = assembleToolPool({ permissions: permissionsFullAccess() });
+        this._skillManager = new SkillManager(this._extensionUri.fsPath);
 
         const saved = this._sessionStore.load();
         if (saved) {
@@ -145,6 +149,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
         this._sendSavedSettings(webviewView);
 
+        // Watch user skills directory — auto-refresh skill list on save
+        if (this._skillWatcher) { this._skillWatcher.dispose(); }
+        this._skillWatcher = this._skillManager.watchUserSkills(() => {
+            webviewView.webview.postMessage({
+                type: 'skillList',
+                value: this._skillManager.getSlashCommands(),
+            });
+        });
+
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
                 case "webviewReady":
@@ -193,6 +206,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 case "fetchModels":
                     this._handleFetchModels(webviewView, data.value as Record<string, string>);
                     break;
+                case "fetchSkills":
+                    webviewView.webview.postMessage({
+                        type: 'skillList',
+                        value: this._skillManager.getSlashCommands(),
+                    });
+                    break;
+                case "refreshSkills":
+                    this._skillManager.refresh();
+                    webviewView.webview.postMessage({
+                        type: 'skillList',
+                        value: this._skillManager.getSlashCommands(),
+                    });
+                    break;
             }
         });
     }
@@ -216,6 +242,103 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         // Track current model/provider for context limit lookups
         this._currentModel = model;
         this._currentProvider = provider;
+
+        // Handle commands that don't need an API key
+        if (prompt && prompt.trim() === '/skill-list') {
+            const builtIn = this._skillManager.skills.filter(s => s.source === 'built-in');
+            const user = this._skillManager.skills.filter(s => s.source === 'user');
+            let msg = '**Available Skills:**\n\n';
+            if (user.length > 0) {
+                msg += '**Your Custom Skills:**\n';
+                for (const s of user) {
+                    msg += `- \`/skill-${s.id}\` — ${s.description}\n`;
+                }
+                msg += '\n';
+            }
+            msg += `**Built-in Skills** (${builtIn.length}):\n`;
+            for (const s of builtIn) {
+                msg += `- \`/skill-${s.id}\` — ${s.description.substring(0, 100)}\n`;
+            }
+            msg += `\nUser skills are stored at: \`${this._skillManager.userSkillsDir}\``;
+            webviewView.webview.postMessage({ type: 'addResponse', value: msg });
+            webviewView.webview.postMessage({ type: 'done' });
+            return;
+        }
+        if (prompt && prompt.trim().startsWith('/skill-create')) {
+            const skillName = prompt.trim().slice('/skill-create'.length).trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
+            if (!skillName) {
+                webviewView.webview.postMessage({
+                    type: 'addResponse',
+                    value: `Usage: \`/skill-create <name>\`\n\nExample: \`/skill-create explain-code\`\n\nThis creates \`~/.claw-agent/skills/<name>/SKILL.md\` and opens it for editing.`,
+                });
+                webviewView.webview.postMessage({ type: 'done' });
+                return;
+            }
+            if (this._skillManager.hasSkill(skillName)) {
+                const skill = this._skillManager.getSkill(skillName)!;
+                // If it's a user skill, just open it for editing
+                if (skill.source === 'user') {
+                    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(skill.skillMdPath));
+                    await vscode.window.showTextDocument(doc);
+                    webviewView.webview.postMessage({
+                        type: 'addResponse',
+                        value: `Skill **${skillName}** already exists — opened for editing.\n\nSave the file and it will be available via \`/skill-${skillName}\`.`,
+                    });
+                } else {
+                    webviewView.webview.postMessage({
+                        type: 'addResponse',
+                        value: `**${skillName}** is a built-in skill. Choose a different name.`,
+                    });
+                }
+                webviewView.webview.postMessage({ type: 'done' });
+                return;
+            }
+            try {
+                const skillMdPath = this._skillManager.scaffoldSkill(skillName);
+                const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(skillMdPath));
+                await vscode.window.showTextDocument(doc);
+                webviewView.webview.postMessage({
+                    type: 'addResponse',
+                    value: `Created skill at \`${skillMdPath}\`\n\nEdit the SKILL.md in the editor, then test it with:\n\`\`\`\n/skill-${skillName} <your request>\n\`\`\``,
+                });
+                // Refresh skill list
+                webviewView.webview.postMessage({ type: 'skillList', value: this._skillManager.getSlashCommands() });
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                webviewView.webview.postMessage({ type: 'addResponse', value: `Failed to create skill: ${msg}` });
+            }
+            webviewView.webview.postMessage({ type: 'done' });
+            return;
+        }
+        if (prompt && prompt.trim().startsWith('/skill-delete')) {
+            const skillId = prompt.trim().slice('/skill-delete'.length).trim().toLowerCase();
+            if (!skillId) {
+                const userSkills = this._skillManager.skills.filter(s => s.source === 'user');
+                const list = userSkills.length > 0
+                    ? userSkills.map(s => `- **${s.id}** — ${s.description}`).join('\n')
+                    : '(no user skills found)';
+                webviewView.webview.postMessage({
+                    type: 'addResponse',
+                    value: `Usage: \`/skill-delete <name>\`\n\n**Your custom skills:**\n${list}`,
+                });
+            } else {
+                const skill = this._skillManager.getSkill(skillId);
+                if (!skill) {
+                    webviewView.webview.postMessage({ type: 'addResponse', value: `Skill **${skillId}** not found.` });
+                } else if (skill.source === 'built-in') {
+                    webviewView.webview.postMessage({ type: 'addResponse', value: `Cannot delete built-in skill **${skillId}**.` });
+                } else {
+                    const deleted = this._skillManager.deleteUserSkill(skillId);
+                    webviewView.webview.postMessage({
+                        type: 'addResponse',
+                        value: deleted ? `Deleted skill **${skillId}**.` : `Failed to delete skill **${skillId}**.`,
+                    });
+                    webviewView.webview.postMessage({ type: 'skillList', value: this._skillManager.getSlashCommands() });
+                }
+            }
+            webviewView.webview.postMessage({ type: 'done' });
+            return;
+        }
 
         if (!apiKey) {
             webviewView.webview.postMessage({ type: 'addResponse', value: 'Please set your API key in the settings panel above.' });
@@ -316,6 +439,33 @@ Steps:
 4. Provide a clear summary with specific line references and suggestions.
 
 Be constructive and specific. Do NOT ask questions — just review.`;
+        } else if (prompt.trim().startsWith('/skill-')) {
+            const parts = prompt.trim().split(/\s+/);
+            const skillCmd = parts[0];
+            const skillId = skillCmd.slice('/skill-'.length);
+            const userRequest = prompt.trim().slice(skillCmd.length).trim();
+
+            if (!this._skillManager.hasSkill(skillId)) {
+                const available = this._skillManager.skills.map(s => `/skill-${s.id}`).join(', ');
+                webviewView.webview.postMessage({
+                    type: 'addResponse',
+                    value: `Unknown skill: **${skillId}**\n\nAvailable skills: ${available || '(none found)'}`,
+                });
+                webviewView.webview.postMessage({ type: 'done' });
+                return;
+            }
+
+            if (!userRequest) {
+                const skill = this._skillManager.getSkill(skillId)!;
+                webviewView.webview.postMessage({
+                    type: 'addResponse',
+                    value: `**/skill-${skill.id}** — ${skill.description}\n\nUsage: \`/skill-${skill.id} <your request>\``,
+                });
+                webviewView.webview.postMessage({ type: 'done' });
+                return;
+            }
+
+            fullPrompt = this._skillManager.buildSkillPrompt(skillId, userRequest) || prompt;
         }
 
         if (fileAttachments && fileAttachments.length > 0) {

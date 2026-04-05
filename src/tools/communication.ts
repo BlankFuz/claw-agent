@@ -8,6 +8,9 @@
 
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { promisify } from 'util';
 import { defineTool, ToolSpec } from './types';
 
@@ -201,13 +204,14 @@ export const replTool: ToolSpec = defineTool({
         const language = args.language as string;
         const code = args.code as string;
 
-        // For simplicity, use exec with -c / -e flags (non-interactive but functional)
-        const cmd = language === 'python'
-            ? `python -c "${code.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
-            : `node -e "${code.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`;
+        // Write code to a temp file to avoid shell escaping issues with -c / -e
+        const ext = language === 'python' ? '.py' : '.js';
+        const tmpFile = path.join(os.tmpdir(), `claw-repl-${Date.now()}${ext}`);
+        const runner = language === 'python' ? 'python' : 'node';
 
         try {
-            const { stdout, stderr } = await execAsync(cmd, {
+            fs.writeFileSync(tmpFile, code, 'utf-8');
+            const { stdout, stderr } = await execAsync(`${runner} "${tmpFile}"`, {
                 cwd: ctx.workspaceRoot,
                 timeout: 30000,
                 maxBuffer: 1024 * 1024,
@@ -220,6 +224,8 @@ export const replTool: ToolSpec = defineTool({
         } catch (err: unknown) {
             const message = err instanceof Error ? err.message : String(err);
             return `REPL error: ${message}`;
+        } finally {
+            try { fs.unlinkSync(tmpFile); } catch { /* ignore cleanup errors */ }
         }
     },
 });

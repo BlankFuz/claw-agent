@@ -899,7 +899,17 @@ window.addEventListener('message', e => {
             scrollBottom();
             break;
         }
+        case 'compactStatus': {
+            // Status update (e.g. "Summarizing...") — don't clear chat
+            const statusDiv = document.createElement('div');
+            statusDiv.className = 'msg msg-system-cmd';
+            statusDiv.textContent = msg.value;
+            messagesDiv.appendChild(statusDiv);
+            scrollBottom();
+            break;
+        }
         case 'compactDone': {
+            // Keep old messages visible — compact only affects the backend context
             const sysDiv = document.createElement('div');
             sysDiv.className = 'msg msg-system-cmd';
             sysDiv.textContent = msg.value;
@@ -1256,7 +1266,11 @@ function send() {
                     input.style.height = 'auto';
                     return;
                 }
-                addUser(text);
+                var styleFilePaths = attachedFiles.map(function(f) { return f.path; });
+                codeContexts.forEach(function(ctx) {
+                    styleFilePaths.push(ctx.filePath + ':' + ctx.startLine + '-' + ctx.endLine);
+                });
+                addUser(text, pendingImages.length > 0 ? pendingImages.map(function(im) { return im.dataUrl; }) : null, styleFilePaths.length > 0 ? styleFilePaths : null);
                 setRunning(true);
                 vscode.postMessage({
                     type: 'askAgent',
@@ -1296,7 +1310,11 @@ function send() {
             default:
                 // Handle /skill-* commands dynamically
                 if (cmd.startsWith('/skill-')) {
-                    addUser(text);
+                    var skillFilePaths = attachedFiles.map(function(f) { return f.path; });
+                    codeContexts.forEach(function(ctx) {
+                        skillFilePaths.push(ctx.filePath + ':' + ctx.startLine + '-' + ctx.endLine);
+                    });
+                    addUser(text, pendingImages.length > 0 ? pendingImages.map(function(im) { return im.dataUrl; }) : null, skillFilePaths.length > 0 ? skillFilePaths : null);
                     setRunning(true);
                     vscode.postMessage({
                         type: 'askAgent',

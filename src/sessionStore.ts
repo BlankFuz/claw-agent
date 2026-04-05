@@ -58,7 +58,17 @@ export class SessionStore {
 
     /** Save current session for the current workspace. */
     save(sessionId: string, messages: ChatMessage[], usage: UsageSummary): void {
-        const trimmed = messages.slice(-MAX_STORED_MESSAGES);
+        let trimmed: ChatMessage[];
+        if (messages.length > MAX_STORED_MESSAGES) {
+            // Always preserve the first 2 messages — they contain the compact
+            // summary context (user: "[Previous conversation...]", assistant: <summary>).
+            // Dropping them causes the LLM to lose all prior context on reload.
+            const head = messages.slice(0, 2);
+            const tail = messages.slice(-(MAX_STORED_MESSAGES - 2));
+            trimmed = [...head, ...tail];
+        } else {
+            trimmed = messages;
+        }
         const key = this._currentKey();
         const session: StoredSession = {
             sessionId,

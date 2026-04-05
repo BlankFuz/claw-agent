@@ -208,6 +208,11 @@ export class ToolPool {
         }
     }
 
+    /** Set a value on the turn state (available to all tools). */
+    setTurnState(key: string, value: unknown): void {
+        this._turnState.set(key, value);
+    }
+
     /** Reset turn state between user messages. */
     resetTurn(): void {
         // Preserve persistent state across turns, clear everything else
@@ -215,11 +220,13 @@ export class ToolPool {
         const config = this._turnState.get('config');
         const backgroundTasks = this._turnState.get('backgroundTasks');
         const worktree = this._turnState.get('worktree');
+        const skillManager = this._turnState.get('skillManager');
         this._turnState.clear();
         if (allTools) { this._turnState.set('allTools', allTools); }
         if (config) { this._turnState.set('config', config); }
         if (backgroundTasks) { this._turnState.set('backgroundTasks', backgroundTasks); }
         if (worktree) { this._turnState.set('worktree', worktree); }
+        if (skillManager) { this._turnState.set('skillManager', skillManager); }
     }
 }
 

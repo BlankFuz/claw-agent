@@ -8,7 +8,7 @@ import { SkillManager } from "./skillManager";
 
 const HARNESS_CONFIG = {
     maxTurns: 32,
-    compactAfterMessages: 40,
+    compactAfterMessages: 120,
     defaultThinkingBudget: 10000,
     /** Fraction of model's max context at which to auto-compact. */
     autoCompactRatio: 0.85,
@@ -90,6 +90,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     _thinkingEnabled = true;
     _autoApprove = false;
     _lastContextTokens = 0;
+    _lastContinuationHint: string | null = null;
     _currentModel: string | undefined;
     _currentProvider: string | undefined;
 
@@ -113,6 +114,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         this._history = [];
         this._costTracker.reset();
         this._lastContextTokens = 0;
+        this._lastContinuationHint = null;
         this._sessionStore.clear();
         this._toolPool.resetTurn();
         if (this._view) {
@@ -350,8 +352,24 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             return;
         }
 
-        // Handle /learn command — inject workspace exploration prompt
+        // Detect continuation messages after turn limit
         let fullPrompt = prompt;
+        const trimmed = prompt.trim().toLowerCase();
+        const continuePatterns = ['continue', 'go on', 'keep going', 'proceed', 'go ahead', 'yes', 'do it', 'continue what you were doing', 'continue what your doing'];
+        const isContinuation = this._lastContinuationHint && continuePatterns.some(p => trimmed === p || trimmed.startsWith(p));
+
+        if (isContinuation && this._lastContinuationHint) {
+            fullPrompt = `The user wants you to continue the task you were working on before hitting the turn limit. Here is what you were doing:
+
+${this._lastContinuationHint}
+
+Review the conversation history above carefully, identify what remains to be done, and continue executing from where you left off. Do NOT start over — pick up exactly where you stopped.
+
+User's message: ${prompt}`;
+            this._lastContinuationHint = null;
+        }
+
+        // Handle /learn command — inject workspace exploration prompt
         if (prompt.trim() === '/learn') {
             const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || 'the current directory';
             fullPrompt = `You are being asked to thoroughly learn and explore this workspace to build deep context for future questions. Spend this entire turn exploring the codebase. Do NOT ask the user any questions — just explore autonomously.
@@ -470,7 +488,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
 
         if (fileAttachments && fileAttachments.length > 0) {
             const fileContext = fileAttachments.map(f => `--- ${f.path} ---\n${f.content}`).join('\n\n');
-            fullPrompt = `${prompt}\n\n<attached_files>\n${fileContext}\n</attached_files>`;
+            fullPrompt = `${fullPrompt}\n\n<attached_files>\n${fileContext}\n</attached_files>`;
         }
 
         const images: ImageAttachment[] | undefined = rawImages?.length
@@ -479,6 +497,8 @@ Be constructive and specific. Do NOT ask questions — just review.`;
 
         this._history.push({ role: 'user', content: fullPrompt, ...(images ? { images } : {}) });
         this._toolPool.resetTurn();
+        // Make SkillManager available to the Skill tool via turnState
+        this._toolPool.setTurnState('skillManager', this._skillManager);
         this._abortController = new AbortController();
 
         const postMessage = (msg: Record<string, unknown>) => {
@@ -581,7 +601,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                     const compactThreshold = Math.floor(ctxLimit * HARNESS_CONFIG.autoCompactRatio);
                     if (this._lastContextTokens >= compactThreshold) {
                         webviewView.webview.postMessage({
-                            type: 'compactDone',
+                            type: 'compactStatus',
                             value: `Auto-compacting: context reached ${Math.round(this._lastContextTokens / 1000)}k tokens...`,
                         });
                         await this._handleCompact(webviewView, this._getCurrentSettings());
@@ -595,10 +615,38 @@ Be constructive and specific. Do NOT ask questions — just review.`;
             }
 
             if (turnsUsed >= HARNESS_CONFIG.maxTurns) {
+                // Build a brief summary of what the agent was doing when it hit the limit
+                const lastAssistant = [...this._history].reverse().find(m => m.role === 'assistant');
+                const pendingToolCalls = lastAssistant?.toolCalls?.map(tc => tc.name).join(', ') || '';
+                const lastToolResult = [...this._history].reverse().find(m => m.role === 'tool');
+
+                let continuationHint = 'The assistant was working on the task when the turn limit was reached.';
+                if (pendingToolCalls) {
+                    continuationHint = `The assistant was using tools (${pendingToolCalls}) when the turn limit was reached.`;
+                }
+                if (lastAssistant?.content) {
+                    const snippet = lastAssistant.content.substring(0, 300);
+                    continuationHint += ` Last message: "${snippet}"`;
+                }
+
+                // Store the continuation hint so the next user message gets context
+                this._lastContinuationHint = continuationHint;
+
                 webviewView.webview.postMessage({
                     type: 'addResponse',
-                    value: `Reached max ${HARNESS_CONFIG.maxTurns} turns. Send another message to continue.`,
+                    value: `Reached max ${HARNESS_CONFIG.maxTurns} turns. Say **"continue"** to pick up where I left off.`,
                 });
+
+                // Use LLM-based compact if possible to preserve context across continuation
+                const ctxLimit = this._getContextLimit();
+                const compactThreshold = Math.floor(ctxLimit * HARNESS_CONFIG.autoCompactRatio);
+                if (this._lastContextTokens >= compactThreshold * 0.7) {
+                    await this._handleCompact(webviewView, this._getCurrentSettings());
+                    this._lastContextTokens = 0;
+                    this._postContextBar(webviewView);
+                }
+            } else {
+                this._lastContinuationHint = null;
             }
 
             this._compactHistoryIfNeeded();
@@ -707,8 +755,37 @@ Be constructive and specific. Do NOT ask questions — just review.`;
     private async _handleReadFileForAttach(webviewView: vscode.WebviewView, filePath: string) {
         try {
             const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-            const path = await import('path');
-            const uri = vscode.Uri.file(path.resolve(wsRoot, filePath));
+            const pathMod = await import('path');
+            const resolvedPath = pathMod.resolve(wsRoot, filePath);
+            const ext = pathMod.extname(filePath).toLowerCase();
+
+            // Binary file types that cannot be read as UTF-8 text
+            const binaryExts = new Set([
+                '.xlsx', '.xls', '.xlsm', '.xlsb',
+                '.pdf',
+                '.docx', '.doc', '.pptx', '.ppt',
+                '.zip', '.rar', '.7z', '.tar', '.gz',
+                '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.ico', '.svg',
+                '.mp3', '.mp4', '.wav', '.avi', '.mkv', '.mov',
+                '.exe', '.dll', '.so', '.dylib', '.bin',
+                '.sqlite', '.db',
+            ]);
+
+            if (binaryExts.has(ext)) {
+                // For binary files, attach as a path reference — the agent/skill
+                // should use appropriate tools (python, openpyxl, pdfplumber, etc.) to read it
+                const uri = vscode.Uri.file(resolvedPath);
+                const stat = await vscode.workspace.fs.stat(uri);
+                const sizeKB = Math.round(stat.size / 1024);
+                const content = `[Binary file: ${ext} — ${sizeKB} KB]\nFull path: ${resolvedPath}\n\nThis is a binary file that cannot be displayed as text. Use the appropriate tool or library to read it (e.g., openpyxl for .xlsx, pdfplumber for .pdf, python-docx for .docx).`;
+                webviewView.webview.postMessage({
+                    type: 'fileContentForAttach',
+                    value: { path: filePath, content },
+                });
+                return;
+            }
+
+            const uri = vscode.Uri.file(resolvedPath);
             const data = await vscode.workspace.fs.readFile(uri);
             const content = Buffer.from(data).toString('utf-8');
             // Limit to first 500 lines to avoid token bloat
@@ -928,7 +1005,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
     private async _handleCompact(webviewView: vscode.WebviewView, settings?: Record<string, unknown>) {
         const before = this._history.length;
         if (before <= 4) {
-            webviewView.webview.postMessage({ type: 'compactDone', value: 'Nothing to compact (history too short).' });
+            webviewView.webview.postMessage({ type: 'compactStatus', value: 'Nothing to compact (history too short).' });
             return;
         }
 
@@ -943,36 +1020,41 @@ Be constructive and specific. Do NOT ask questions — just review.`;
             return;
         }
 
-        webviewView.webview.postMessage({ type: 'compactDone', value: 'Summarizing conversation...' });
+        webviewView.webview.postMessage({ type: 'compactStatus', value: 'Summarizing conversation...' });
 
         try {
-            // Build a text representation of the conversation for the LLM to summarize
+            // Build a text representation of the conversation for the LLM to summarize.
+            // Give tool results more space so important output (file contents, data) is preserved.
             const conversationText = this._history.map(m => {
                 if (m.role === 'user') { return `USER: ${m.content}`; }
                 if (m.role === 'assistant') {
                     let text = `ASSISTANT: ${m.content || ''}`;
                     if (m.toolCalls?.length) {
-                        text += '\n  Tool calls: ' + m.toolCalls.map(tc => `${tc.name}(${JSON.stringify(tc.arguments).substring(0, 100)})`).join(', ');
+                        text += '\n  Tool calls: ' + m.toolCalls.map(tc => `${tc.name}(${JSON.stringify(tc.arguments).substring(0, 200)})`).join(', ');
                     }
                     return text;
                 }
-                if (m.role === 'tool') { return `TOOL RESULT: ${m.content.substring(0, 200)}`; }
+                if (m.role === 'tool') { return `TOOL RESULT: ${m.content.substring(0, 1000)}`; }
                 return '';
             }).join('\n');
 
             const summaryPrompt: ChatMessage[] = [{
                 role: 'user',
-                content: `Summarize this conversation into a concise context block. Preserve:
-- What files were read, created, or modified (with paths)
+                content: `You are a conversation summarizer. Your job is to produce a detailed summary that will REPLACE the conversation history. The assistant will ONLY have your summary to work from — anything you omit is permanently lost.
+
+Summarize this conversation into a structured context block. You MUST preserve:
+- The user's original request and goal
+- What files were read, created, or modified (with full paths)
+- Key data, results, or output that was shown to the user
 - Key decisions made and why
 - Current state of the task (what's done, what's pending)
 - Any errors encountered and how they were resolved
 - Important code patterns or conventions discovered
 
-Be concise but thorough. Format as a structured summary the assistant can use to continue working without losing context.
+Be thorough. If the conversation involved reading data from files, include a summary of that data. The assistant needs enough context to seamlessly continue the conversation.
 
 CONVERSATION:
-${conversationText.substring(0, 12000)}`
+${conversationText.substring(0, 20000)}`
             }];
 
             const response = await askLLM({
@@ -989,12 +1071,20 @@ ${conversationText.substring(0, 12000)}`
                 this._costTracker.record('compact', response.usage.inputTokens, response.usage.outputTokens);
             }
 
-            // Keep last few recent messages for immediate context
-            const recentCount = Math.min(6, Math.floor(before * 0.2));
-            let sliceStart = before - recentCount;
-            while (sliceStart < before && this._history[sliceStart].role !== 'user') {
+            // Keep last few recent messages for immediate context.
+            // Walk backwards to find a clean cut point at a 'user' message boundary,
+            // keeping at least 4 and up to 8 recent messages.
+            const targetRecent = Math.min(8, Math.max(4, Math.floor(before * 0.2)));
+            let sliceStart = before - targetRecent;
+            if (sliceStart < 0) { sliceStart = 0; }
+            // Walk forward to find a 'user' message (clean boundary), but don't
+            // walk past more than half the remaining messages
+            const maxWalk = sliceStart + Math.floor(targetRecent / 2);
+            while (sliceStart < maxWalk && sliceStart < before && this._history[sliceStart].role !== 'user') {
                 sliceStart++;
             }
+            // If we couldn't find a user message, just take what we have
+            if (sliceStart >= before) { sliceStart = Math.max(0, before - 4); }
             const recentMessages = this._history.slice(sliceStart);
 
             // Replace history with: summary as a user/assistant pair + recent messages
@@ -1008,7 +1098,7 @@ ${conversationText.substring(0, 12000)}`
 
             webviewView.webview.postMessage({
                 type: 'compactDone',
-                value: `Compacted: ${before} messages → ${this._history.length} (summary + ${recentMessages.length} recent). Context preserved.`,
+                value: `Conversation summarized and context preserved. Starting fresh session.`,
             });
             this._postUsage(webviewView);
 

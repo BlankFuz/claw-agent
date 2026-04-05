@@ -97,14 +97,15 @@ export const skillTool: ToolSpec = defineTool({
     name: 'Skill',
     category: 'agent',
     description:
-        'Load and execute a predefined skill (specialized workflow). ' +
-        'Skills are prompt templates for common tasks like committing, reviewing, testing, etc. ' +
-        'Available skills: ' + Object.keys(BUILT_IN_SKILLS).join(', '),
+        'Load and execute a skill (specialized workflow). ' +
+        'Skills include both built-in shortcuts and folder-based skills with detailed instructions. ' +
+        'Built-in: ' + Object.keys(BUILT_IN_SKILLS).join(', ') + '. ' +
+        'Folder-based skills (e.g. xlsx, pdf, docx, frontend-design) are also available — use them by name.',
     parameters: {
         type: 'object',
         properties: {
-            skill: { type: 'string', description: 'The skill name to execute, e.g. "commit", "review", "test", "explain", "fix", "simplify".' },
-            args: { type: 'string', description: 'Optional arguments to pass to the skill.' },
+            skill: { type: 'string', description: 'The skill name to execute, e.g. "commit", "xlsx", "pdf", "frontend-design".' },
+            args: { type: 'string', description: 'Optional arguments or the user request to pass to the skill.' },
         },
         required: ['skill'],
     },
@@ -115,23 +116,43 @@ export const skillTool: ToolSpec = defineTool({
         const skillName = args.skill as string;
         const skillArgs = args.args as string | undefined;
 
-        const skill = BUILT_IN_SKILLS[skillName];
-        if (!skill) {
-            const available = Object.entries(BUILT_IN_SKILLS)
-                .map(([name, s]) => `- **${name}**: ${s.description}`)
-                .join('\n');
-            return `Unknown skill "${skillName}". Available skills:\n${available}`;
+        // 1. Check hardcoded built-in skills first
+        const builtIn = BUILT_IN_SKILLS[skillName];
+        if (builtIn) {
+            const prompt = skillArgs ? `${builtIn.prompt}\n\nAdditional context: ${skillArgs}` : builtIn.prompt;
+            ctx.turnState.set('pendingSubAgent', {
+                description: `Skill: ${skillName}`,
+                prompt,
+            });
+            return `Skill "${skillName}" loaded: ${builtIn.description}. Executing...`;
         }
 
-        // Inject the skill as a sub-agent task
-        const prompt = skillArgs ? `${skill.prompt}\n\nAdditional context: ${skillArgs}` : skill.prompt;
+        // 2. Check folder-based skills via SkillManager (if available)
+        const skillManager = ctx.turnState.get('skillManager') as
+            { hasSkill: (id: string) => boolean; buildSkillPrompt: (id: string, req: string) => string | null; getSkill: (id: string) => { name: string; description: string } | undefined; skills: Array<{ id: string; description: string }> } | undefined;
 
-        ctx.turnState.set('pendingSubAgent', {
-            description: `Skill: ${skillName}`,
-            prompt,
-        });
+        if (skillManager && skillManager.hasSkill(skillName)) {
+            const skill = skillManager.getSkill(skillName)!;
+            const prompt = skillManager.buildSkillPrompt(skillName, skillArgs || '');
+            if (prompt) {
+                ctx.turnState.set('pendingSubAgent', {
+                    description: `Skill: ${skill.name}`,
+                    prompt,
+                });
+                return `Skill "${skillName}" loaded: ${skill.description}. Executing...`;
+            }
+        }
 
-        return `Skill "${skillName}" loaded: ${skill.description}. Executing...`;
+        // 3. Not found — list all available skills
+        const builtInList = Object.entries(BUILT_IN_SKILLS)
+            .map(([name, s]) => `- **${name}**: ${s.description}`)
+            .join('\n');
+        const folderList = skillManager
+            ? skillManager.skills.map(s => `- **${s.id}**: ${s.description}`).join('\n')
+            : '';
+        const allSkills = folderList ? `${builtInList}\n${folderList}` : builtInList;
+
+        return `Unknown skill "${skillName}". Available skills:\n${allSkills}`;
     },
 });
 

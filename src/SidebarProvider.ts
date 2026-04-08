@@ -5,13 +5,19 @@ import { CostTracker } from "./costTracker";
 import { permissionsFullAccess } from "./permissions";
 import { SessionStore } from "./sessionStore";
 import { SkillManager } from "./skillManager";
+import { MemPalace } from "./mempalace";
+import { compactSession, shouldCompact, estimateSessionTokens, CompactionConfig, DEFAULT_COMPACTION_CONFIG } from "./compact";
 
 const HARNESS_CONFIG = {
-    maxTurns: 32,
-    compactAfterMessages: 120,
+    /** No hard turn limit — let the agent run until the task is done. */
+    maxTurns: Number.MAX_SAFE_INTEGER,
+    /** Message count threshold for silent history trim (raised from 120). */
+    compactAfterMessages: 200,
     defaultThinkingBudget: 10000,
     /** Fraction of model's max context at which to auto-compact. */
     autoCompactRatio: 0.85,
+    /** Max chars to store per tool result in history (not just UI). */
+    toolResultHistoryLimit: 20_000,
 } as const;
 
 /** Known context window sizes (tokens) for common models. */
@@ -93,6 +99,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     _lastContinuationHint: string | null = null;
     _currentModel: string | undefined;
     _currentProvider: string | undefined;
+    _mempalace: MemPalace = new MemPalace();
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -342,6 +349,29 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             return;
         }
 
+        // ── MemPalace commands (no API key needed) ──
+        if (prompt && prompt.trim().startsWith('/memory-setup')) {
+            await this._handleMemorySetup(webviewView);
+            return;
+        }
+        if (prompt && prompt.trim().startsWith('/memory-status')) {
+            await this._handleMemoryStatus(webviewView);
+            return;
+        }
+        if (prompt && prompt.trim().startsWith('/memory')) {
+            const query = prompt.trim().slice('/memory'.length).trim();
+            if (!query) {
+                webviewView.webview.postMessage({
+                    type: 'addResponse',
+                    value: '**Memory Commands:**\n- `/memory <query>` — Search past conversations\n- `/memory-status` — Show MemPalace status\n- `/memory-setup` — Install MemPalace (one-time setup)',
+                });
+                webviewView.webview.postMessage({ type: 'done' });
+                return;
+            }
+            await this._handleMemorySearch(webviewView, query);
+            return;
+        }
+
         if (!apiKey) {
             webviewView.webview.postMessage({ type: 'addResponse', value: 'Please set your API key in the settings panel above.' });
             webviewView.webview.postMessage({ type: 'done' });
@@ -495,10 +525,20 @@ Be constructive and specific. Do NOT ask questions — just review.`;
             ? rawImages.map(img => ({ data: img.data, mediaType: img.mediaType }))
             : undefined;
 
+        // MemPalace auto-recall: on first message or right after compact,
+        // search for relevant past context and inject it silently
+        if (this._history.length <= 4) {
+            const recalled = await this._mempalaceRecall(prompt);
+            if (recalled) {
+                fullPrompt = `<past_context source="mempalace">\nThe following memories from past conversations may be relevant:\n\n${recalled}\n</past_context>\n\n${fullPrompt}`;
+            }
+        }
+
         this._history.push({ role: 'user', content: fullPrompt, ...(images ? { images } : {}) });
         this._toolPool.resetTurn();
         // Make SkillManager available to the Skill tool via turnState
         this._toolPool.setTurnState('skillManager', this._skillManager);
+        this._toolPool.setTurnState('mempalace', this._mempalace);
         this._abortController = new AbortController();
 
         const postMessage = (msg: Record<string, unknown>) => {
@@ -568,7 +608,12 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                             autoApprove: this._autoApprove,
                         });
 
-                        this._history.push({ role: 'tool', content: result, toolCallId: tc.id });
+                        // Truncate tool output before storing in history to prevent context bloat.
+                        // UI display has its own separate truncation for rendering.
+                        const historyResult = result.length > HARNESS_CONFIG.toolResultHistoryLimit
+                            ? result.substring(0, HARNESS_CONFIG.toolResultHistoryLimit) + `\n... (truncated, ${result.length} chars total)`
+                            : result;
+                        this._history.push({ role: 'tool', content: historyResult, toolCallId: tc.id });
 
                         // Quiet tools: show compact inline instead of full result block
                         const quietTools = ['TodoWrite', 'Sleep'];
@@ -604,7 +649,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                             type: 'compactStatus',
                             value: `Auto-compacting: context reached ${Math.round(this._lastContextTokens / 1000)}k tokens...`,
                         });
-                        await this._handleCompact(webviewView, this._getCurrentSettings());
+                        this._structuredCompact(webviewView);
                         this._lastContextTokens = 0;
                         this._postContextBar(webviewView);
                     }
@@ -614,42 +659,14 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                 }
             }
 
-            if (turnsUsed >= HARNESS_CONFIG.maxTurns) {
-                // Build a brief summary of what the agent was doing when it hit the limit
-                const lastAssistant = [...this._history].reverse().find(m => m.role === 'assistant');
-                const pendingToolCalls = lastAssistant?.toolCalls?.map(tc => tc.name).join(', ') || '';
-                const lastToolResult = [...this._history].reverse().find(m => m.role === 'tool');
+            // No hard turn limit — the agent runs until the task is done.
+            // Clear continuation hint on normal completion.
+            this._lastContinuationHint = null;
 
-                let continuationHint = 'The assistant was working on the task when the turn limit was reached.';
-                if (pendingToolCalls) {
-                    continuationHint = `The assistant was using tools (${pendingToolCalls}) when the turn limit was reached.`;
-                }
-                if (lastAssistant?.content) {
-                    const snippet = lastAssistant.content.substring(0, 300);
-                    continuationHint += ` Last message: "${snippet}"`;
-                }
-
-                // Store the continuation hint so the next user message gets context
-                this._lastContinuationHint = continuationHint;
-
-                webviewView.webview.postMessage({
-                    type: 'addResponse',
-                    value: `Reached max ${HARNESS_CONFIG.maxTurns} turns. Say **"continue"** to pick up where I left off.`,
-                });
-
-                // Use LLM-based compact if possible to preserve context across continuation
-                const ctxLimit = this._getContextLimit();
-                const compactThreshold = Math.floor(ctxLimit * HARNESS_CONFIG.autoCompactRatio);
-                if (this._lastContextTokens >= compactThreshold * 0.7) {
-                    await this._handleCompact(webviewView, this._getCurrentSettings());
-                    this._lastContextTokens = 0;
-                    this._postContextBar(webviewView);
-                }
-            } else {
-                this._lastContinuationHint = null;
+            // Structured auto-compact if history exceeds message count threshold
+            if (this._history.length > HARNESS_CONFIG.compactAfterMessages) {
+                this._structuredCompact(webviewView);
             }
-
-            this._compactHistoryIfNeeded();
             this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
 
         } catch (err: unknown) {
@@ -721,7 +738,29 @@ Be constructive and specific. Do NOT ask questions — just review.`;
         }
 
         return new Promise<boolean>((resolve) => {
-            this._pendingConfirmResolve = resolve;
+            // Safety timeout — auto-deny after 5 minutes to prevent deadlock
+            const timeout = setTimeout(() => {
+                if (this._pendingConfirmResolve === wrappedResolve) {
+                    this._pendingConfirmResolve = null;
+                    resolve(false);
+                }
+            }, 5 * 60 * 1000);
+
+            // Auto-deny if webview is disposed (user closes panel)
+            const disposable = webviewView.onDidDispose(() => {
+                if (this._pendingConfirmResolve === wrappedResolve) {
+                    this._pendingConfirmResolve = null;
+                    resolve(false);
+                }
+            });
+
+            const wrappedResolve = (allowed: boolean) => {
+                clearTimeout(timeout);
+                disposable.dispose();
+                resolve(allowed);
+            };
+
+            this._pendingConfirmResolve = wrappedResolve;
             webviewView.webview.postMessage({
                 type: 'confirmTool',
                 value: { name: toolName, summary, diff },
@@ -1002,146 +1041,68 @@ Be constructive and specific. Do NOT ask questions — just review.`;
         }
     }
 
-    private async _handleCompact(webviewView: vscode.WebviewView, settings?: Record<string, unknown>) {
+    /**
+     * Handle /compact — structured deterministic compaction.
+     *
+     * Generates a structured summary (scope, tools, files, pending work,
+     * timeline) without requiring an LLM call. Previous summaries are
+     * merged so context accumulates across multiple compactions.
+     */
+    private async _handleCompact(webviewView: vscode.WebviewView, _settings?: Record<string, unknown>) {
         const before = this._history.length;
         if (before <= 4) {
-            webviewView.webview.postMessage({ type: 'compactStatus', value: 'Nothing to compact (history too short).' });
+            webviewView.webview.postMessage({ type: 'compactDone', value: `Nothing to compact (history has ${before} messages).` });
             return;
         }
 
-        const provider = settings?.provider as string | undefined;
-        const apiKey = settings?.apiKey as string | undefined;
-        const baseUrl = settings?.baseUrl as string | undefined;
-        const model = settings?.model as string | undefined;
+        webviewView.webview.postMessage({ type: 'compactStatus', value: 'Compacting conversation...' });
 
-        if (!apiKey) {
-            // Fallback: naive compaction if no API key available
-            this._naiveCompact(webviewView);
+        // Save full conversation to MemPalace before compacting (if available)
+        this._mempalaceSaveConversation(webviewView);
+
+        // Use structured compaction with generous recent-message preservation
+        const config: CompactionConfig = {
+            preserveRecentMessages: Math.min(8, Math.max(4, Math.floor(before * 0.2))),
+            maxEstimatedTokens: 1, // Always compact when explicitly requested
+        };
+
+        const result = compactSession(this._history, config);
+
+        if (result.removedMessageCount === 0) {
+            webviewView.webview.postMessage({ type: 'compactDone', value: `Nothing to compact (history has ${before} messages).` });
             return;
         }
 
-        webviewView.webview.postMessage({ type: 'compactStatus', value: 'Summarizing conversation...' });
-
-        try {
-            // Build a text representation of the conversation for the LLM to summarize.
-            // Give tool results more space so important output (file contents, data) is preserved.
-            const conversationText = this._history.map(m => {
-                if (m.role === 'user') { return `USER: ${m.content}`; }
-                if (m.role === 'assistant') {
-                    let text = `ASSISTANT: ${m.content || ''}`;
-                    if (m.toolCalls?.length) {
-                        text += '\n  Tool calls: ' + m.toolCalls.map(tc => `${tc.name}(${JSON.stringify(tc.arguments).substring(0, 200)})`).join(', ');
-                    }
-                    return text;
-                }
-                if (m.role === 'tool') { return `TOOL RESULT: ${m.content.substring(0, 1000)}`; }
-                return '';
-            }).join('\n');
-
-            const summaryPrompt: ChatMessage[] = [{
-                role: 'user',
-                content: `You are a conversation summarizer. Your job is to produce a detailed summary that will REPLACE the conversation history. The assistant will ONLY have your summary to work from — anything you omit is permanently lost.
-
-Summarize this conversation into a structured context block. You MUST preserve:
-- The user's original request and goal
-- What files were read, created, or modified (with full paths)
-- Key data, results, or output that was shown to the user
-- Key decisions made and why
-- Current state of the task (what's done, what's pending)
-- Any errors encountered and how they were resolved
-- Important code patterns or conventions discovered
-
-Be thorough. If the conversation involved reading data from files, include a summary of that data. The assistant needs enough context to seamlessly continue the conversation.
-
-CONVERSATION:
-${conversationText.substring(0, 20000)}`
-            }];
-
-            const response = await askLLM({
-                provider: provider as Provider,
-                apiKey,
-                messages: summaryPrompt,
-                baseUrl,
-                model,
-            });
-
-            const summary = response.text || 'Summary could not be generated.';
-
-            if (response.usage) {
-                this._costTracker.record('compact', response.usage.inputTokens, response.usage.outputTokens);
-            }
-
-            // Keep last few recent messages for immediate context.
-            // Walk backwards to find a clean cut point at a 'user' message boundary,
-            // keeping at least 4 and up to 8 recent messages.
-            const targetRecent = Math.min(8, Math.max(4, Math.floor(before * 0.2)));
-            let sliceStart = before - targetRecent;
-            if (sliceStart < 0) { sliceStart = 0; }
-            // Walk forward to find a 'user' message (clean boundary), but don't
-            // walk past more than half the remaining messages
-            const maxWalk = sliceStart + Math.floor(targetRecent / 2);
-            while (sliceStart < maxWalk && sliceStart < before && this._history[sliceStart].role !== 'user') {
-                sliceStart++;
-            }
-            // If we couldn't find a user message, just take what we have
-            if (sliceStart >= before) { sliceStart = Math.max(0, before - 4); }
-            const recentMessages = this._history.slice(sliceStart);
-
-            // Replace history with: summary as a user/assistant pair + recent messages
-            this._history = [
-                { role: 'user', content: '[Previous conversation was compacted. Here is the summary of what happened:]' },
-                { role: 'assistant', content: summary },
-                ...recentMessages,
-            ];
-
-            this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
-
-            webviewView.webview.postMessage({
-                type: 'compactDone',
-                value: `Conversation summarized and context preserved. Starting fresh session.`,
-            });
-            this._postUsage(webviewView);
-
-        } catch (err: unknown) {
-            const message = err instanceof Error ? err.message : String(err);
-            webviewView.webview.postMessage({
-                type: 'compactDone',
-                value: `Summary failed (${message}). Falling back to naive compaction.`,
-            });
-            this._naiveCompact(webviewView);
-        }
-    }
-
-    /** Simple fallback compaction without LLM — just trims old messages. */
-    private _naiveCompact(webviewView: vscode.WebviewView) {
-        const before = this._history.length;
-        const keepCount = Math.max(4, Math.floor(before * 0.4));
-        let sliceStart = before - keepCount;
-        while (sliceStart < before && this._history[sliceStart].role !== 'user') {
-            sliceStart++;
-        }
-        const removed = sliceStart - 1;
-        this._history = [this._history[0], ...this._history.slice(sliceStart)];
+        this._history = result.compactedHistory;
         this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
+        this._lastContextTokens = 0;
+
         webviewView.webview.postMessage({
             type: 'compactDone',
-            value: `Compacted (no summary): removed ${removed} messages, kept ${this._history.length}.`,
+            value: `Compacted: ${result.removedMessageCount} messages summarized, ${this._history.length} kept.`,
         });
+        this._postUsage(webviewView);
+        this._postContextBar(webviewView);
     }
 
-    private _compactHistoryIfNeeded(): void {
-        if (this._history.length <= HARNESS_CONFIG.compactAfterMessages) { return; }
+    /**
+     * Structured compaction — used for auto-compact triggers.
+     * Runs synchronously (no LLM call), safe to call mid-turn.
+     */
+    private _structuredCompact(webviewView: vscode.WebviewView) {
+        // Save to MemPalace before compacting
+        this._mempalaceSaveConversation(webviewView);
 
-        const keep = Math.floor(HARNESS_CONFIG.compactAfterMessages * 0.75);
-        let sliceStart = this._history.length - keep;
+        const result = compactSession(this._history, DEFAULT_COMPACTION_CONFIG);
+        if (result.removedMessageCount === 0) { return; }
 
-        // Walk forward to find a safe cut point — don't slice in the middle
-        // of an assistant+tool group. A safe start is a 'user' message.
-        while (sliceStart < this._history.length && this._history[sliceStart].role !== 'user') {
-            sliceStart++;
-        }
+        this._history = result.compactedHistory;
+        this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
 
-        this._history = [this._history[0], ...this._history.slice(sliceStart)];
+        webviewView.webview.postMessage({
+            type: 'compactStatus',
+            value: `Auto-compacted: ${result.removedMessageCount} messages summarized.`,
+        });
     }
 
     private _postUsage(webviewView: vscode.WebviewView): void {
@@ -1194,6 +1155,90 @@ ${conversationText.substring(0, 20000)}`
         if (saved) {
             webviewView.webview.postMessage({ type: 'loadSettings', value: saved });
         }
+    }
+
+    // ── MemPalace Integration (optional) ─────────────────────────────────
+
+    /**
+     * Save the current conversation to MemPalace (fire-and-forget).
+     * Called before compact to persist full history.
+     */
+    private _mempalaceSaveConversation(webviewView: vscode.WebviewView): void {
+        // Don't await — run in background so compact isn't blocked
+        this._mempalace.isAvailable().then(available => {
+            if (!available) { return; }
+            const wsName = vscode.workspace.workspaceFolders?.[0]?.name;
+            this._mempalace.saveConversation(this._history, wsName).then(result => {
+                webviewView.webview.postMessage({
+                    type: 'compactStatus',
+                    value: `Memory saved to MemPalace.`,
+                });
+            }).catch(() => { /* silent fail — mempalace is optional */ });
+        }).catch(() => { /* silent fail */ });
+    }
+
+    /**
+     * Search MemPalace for relevant context and inject into history.
+     * Called at the start of the agent loop when there's minimal history.
+     */
+    private async _mempalaceRecall(prompt: string): Promise<string | null> {
+        try {
+            if (!await this._mempalace.isAvailable()) { return null; }
+            const wsName = vscode.workspace.workspaceFolders?.[0]?.name;
+            const results = await this._mempalace.search(prompt, wsName, 3);
+            if (results.length === 0 || (results.length === 1 && results[0].text.startsWith('Search error'))) {
+                return null;
+            }
+            return this._mempalace.formatResults(results);
+        } catch {
+            return null;
+        }
+    }
+
+    /** Handle /memory <query> — manual search. */
+    private async _handleMemorySearch(webviewView: vscode.WebviewView, query: string) {
+        if (!await this._mempalace.isAvailable()) {
+            webviewView.webview.postMessage({
+                type: 'addResponse',
+                value: 'MemPalace is not installed. Run `/memory-setup` to install it.',
+            });
+            webviewView.webview.postMessage({ type: 'done' });
+            return;
+        }
+
+        webviewView.webview.postMessage({
+            type: 'addResponse',
+            value: 'Searching memories...',
+        });
+
+        const results = await this._mempalace.search(query, undefined, 5);
+        const formatted = this._mempalace.formatResults(results);
+        webviewView.webview.postMessage({
+            type: 'addResponse',
+            value: formatted,
+        });
+        webviewView.webview.postMessage({ type: 'done' });
+    }
+
+    /** Handle /memory-status — show palace status. */
+    private async _handleMemoryStatus(webviewView: vscode.WebviewView) {
+        const status = await this._mempalace.getStatus();
+        webviewView.webview.postMessage({
+            type: 'addResponse',
+            value: status,
+        });
+        webviewView.webview.postMessage({ type: 'done' });
+    }
+
+    /** Handle /memory-setup — install mempalace. */
+    private async _handleMemorySetup(webviewView: vscode.WebviewView) {
+        const success = await this._mempalace.install((msg) => {
+            webviewView.webview.postMessage({
+                type: 'addResponse',
+                value: msg,
+            });
+        });
+        webviewView.webview.postMessage({ type: 'done' });
     }
 
     public revive(panel: vscode.WebviewView) { this._view = panel; }
@@ -1355,6 +1400,23 @@ body {
   font-family: var(--mono); opacity: 0.7;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+
+/* Collapsible long content (Read more / Read less) */
+.collapsible-wrap { position: relative; }
+.collapsible-content.collapsed {
+  max-height: 150px; overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+  mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+}
+.collapsible-toggle {
+  display: block; width: 100%; margin-top: 2px; padding: 4px 0;
+  background: none; border: none; cursor: pointer;
+  font-size: 11px; font-weight: 600; font-family: inherit;
+  color: var(--accent); text-align: center;
+  opacity: 0.85; transition: opacity 0.15s;
+}
+.collapsible-toggle:hover { opacity: 1; }
+.collapsible-arrow { font-size: 9px; margin-left: 3px; }
 
 /* Shell command result (like Claude Code) */
 .msg-shell {

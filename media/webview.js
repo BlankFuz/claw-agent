@@ -62,6 +62,9 @@ var SLASH_COMMANDS = [
     { cmd: '/skill-create', desc: 'Create a new custom skill', args: '<name>' },
     { cmd: '/skill-list', desc: 'List all available skills' },
     { cmd: '/skill-delete', desc: 'Delete a custom skill', args: '<name>' },
+    { cmd: '/memory', desc: 'Search past conversations', args: '<query>' },
+    { cmd: '/memory-status', desc: 'Show MemPalace status' },
+    { cmd: '/memory-setup', desc: 'Install MemPalace (one-time)' },
     { cmd: '/help', desc: 'Show all commands' },
 ];
 var skillCommands = []; // populated from extension
@@ -669,7 +672,7 @@ function md(text) {
     h = h.replace(/\*([^*]+)\*/g, '<em>$1</em>');
 
     // Links
-    h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$1" title="$2">$1</a>');
+    h = h.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" title="$1">$1</a>');
 
     // Unordered lists (simple — consecutive lines starting with - or *)
     h = h.replace(/(?:^|\n)((?:[-*] .+\n?)+)/g, function(_, block) {
@@ -741,24 +744,78 @@ function scrollBottom() {
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
 
+// ── Collapsible long content ──
+var COLLAPSE_THRESHOLD = 400; // chars of raw text before collapsing
+
+/**
+ * If the raw text exceeds the threshold, build a collapsible DOM node
+ * with a "Read more" / "Read less" toggle button.
+ * Returns a DOM element (not an HTML string).
+ */
+function makeCollapsible(rawText, renderedHtml) {
+    var wrap = document.createElement('div');
+    wrap.className = 'collapsible-wrap';
+
+    var content = document.createElement('div');
+    content.className = 'collapsible-content collapsed';
+    content.innerHTML = renderedHtml;
+
+    var btn = document.createElement('button');
+    btn.className = 'collapsible-toggle';
+    btn.innerHTML = 'Read more <span class="collapsible-arrow">&#9660;</span>';
+    btn.addEventListener('click', function() {
+        var isCollapsed = content.classList.toggle('collapsed');
+        if (isCollapsed) {
+            btn.innerHTML = 'Read more <span class="collapsible-arrow">&#9660;</span>';
+            wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } else {
+            btn.innerHTML = 'Read less <span class="collapsible-arrow">&#9650;</span>';
+        }
+    });
+
+    wrap.appendChild(content);
+    wrap.appendChild(btn);
+    return wrap;
+}
+
+/** Returns true if the raw text is long enough to warrant collapsing. */
+function needsCollapse(rawText) {
+    return rawText && rawText.length > COLLAPSE_THRESHOLD;
+}
+
 // ── Add message helpers ──
 function addUser(text, imageUrls, filePaths) {
     var div = document.createElement('div');
     div.className = 'msg msg-user';
-    var bodyHtml = md(text);
+
+    var avatar = document.createElement('div');
+    avatar.className = 'msg-user-avatar';
+    avatar.textContent = 'Y';
+
+    var body = document.createElement('div');
+    body.className = 'msg-user-body';
+
+    if (needsCollapse(text)) {
+        body.appendChild(makeCollapsible(text, md(text)));
+    } else {
+        body.innerHTML = md(text);
+    }
+
     if (filePaths && filePaths.length > 0) {
-        bodyHtml += '<div style="margin-top:4px;font-size:11px;color:var(--text-muted);">';
-        filePaths.forEach(function(p) { bodyHtml += '<span class="file-chip" style="margin:2px;"><span class="mention-icon">@</span>' + p + '</span> '; });
-        bodyHtml += '</div>';
+        var chipDiv = document.createElement('div');
+        chipDiv.style.cssText = 'margin-top:4px;font-size:11px;color:var(--text-muted);';
+        filePaths.forEach(function(p) { chipDiv.innerHTML += '<span class="file-chip" style="margin:2px;"><span class="mention-icon">@</span>' + p + '</span> '; });
+        body.appendChild(chipDiv);
     }
     if (imageUrls && imageUrls.length > 0) {
-        bodyHtml += '<div class="msg-user-images">';
-        imageUrls.forEach(function(url) { bodyHtml += '<img src="' + url + '">'; });
-        bodyHtml += '</div>';
+        var imgDiv = document.createElement('div');
+        imgDiv.className = 'msg-user-images';
+        imageUrls.forEach(function(url) { imgDiv.innerHTML += '<img src="' + url + '">'; });
+        body.appendChild(imgDiv);
     }
-    div.innerHTML =
-        '<div class="msg-user-avatar">Y</div>' +
-        '<div class="msg-user-body">' + bodyHtml + '</div>';
+
+    div.appendChild(avatar);
+    div.appendChild(body);
     messagesDiv.appendChild(div);
     scrollBottom();
 }
@@ -766,7 +823,11 @@ function addUser(text, imageUrls, filePaths) {
 function addAssistant(text) {
     const div = document.createElement('div');
     div.className = 'msg msg-assistant';
-    div.innerHTML = md(text);
+    if (needsCollapse(text)) {
+        div.appendChild(makeCollapsible(text, md(text)));
+    } else {
+        div.innerHTML = md(text);
+    }
     messagesDiv.appendChild(div);
     scrollBottom();
 }
@@ -809,7 +870,18 @@ window.addEventListener('message', e => {
             if (progs.length) progs[progs.length - 1].remove();
             const div = document.createElement('div');
             div.className = 'msg msg-tool';
-            div.innerHTML = '<div class="msg-tool-name">' + (msg.value.name || '') + '</div>' + md(msg.value.result);
+            var toolNameDiv = document.createElement('div');
+            toolNameDiv.className = 'msg-tool-name';
+            toolNameDiv.textContent = msg.value.name || '';
+            div.appendChild(toolNameDiv);
+            var toolText = msg.value.result || '';
+            if (needsCollapse(toolText)) {
+                div.appendChild(makeCollapsible(toolText, md(toolText)));
+            } else {
+                var toolBody = document.createElement('div');
+                toolBody.innerHTML = md(toolText);
+                div.appendChild(toolBody);
+            }
             messagesDiv.appendChild(div);
             scrollBottom();
             break;
@@ -909,6 +981,7 @@ window.addEventListener('message', e => {
             break;
         }
         case 'compactDone': {
+            setRunning(false);
             // Keep old messages visible — compact only affects the backend context
             const sysDiv = document.createElement('div');
             sysDiv.className = 'msg msg-system-cmd';
@@ -1152,6 +1225,7 @@ function send() {
         switch (cmd) {
             case '/compact':
                 addUser(text);
+                setRunning(true);
                 vscode.postMessage({
                     type: 'compactHistory',
                     value: {
@@ -1184,6 +1258,24 @@ function send() {
             case '/git':
                 addUser(text);
                 vscode.postMessage({ type: 'refreshGit' });
+                input.value = '';
+                input.style.height = 'auto';
+                return;
+            case '/memory':
+            case '/memory-status':
+            case '/memory-setup':
+                addUser(text);
+                setRunning(true);
+                vscode.postMessage({
+                    type: 'askAgent',
+                    value: {
+                        provider: providerSelect.value,
+                        apiKey: apiKeyInput.value,
+                        prompt: text,
+                        baseUrl: baseUrlInput.value.trim() || undefined,
+                        model: getSelectedModel() || undefined,
+                    }
+                });
                 input.value = '';
                 input.style.height = 'auto';
                 return;
@@ -1295,7 +1387,7 @@ function send() {
             }
             case '/help': {
                 addUser(text);
-                var helpText = '**Available commands:**\n- **/style** `<description>` — CSS/styling expert mode\n- **/commit** `[message]` — Stage changes and commit\n- **/push** `[remote] [branch]` — Push commits to remote\n- **/review** — Review recent changes for bugs and issues\n- **/learn** — Spend a turn exploring the workspace for better context\n- **/compact** — Compress conversation history\n- **/clear** — Clear chat and start fresh\n- **/export** — Export conversation as JSON\n- **/import** — Import a saved conversation\n- **/git** — Refresh git status\n\n**Skill Management:**\n- **/skill-create** `<name> <description>` — Create a new custom skill\n- **/skill-list** — List all available skills (built-in + custom)\n- **/skill-delete** `<name>` — Delete a custom skill\n- **/help** — Show this help';
+                var helpText = '**Available commands:**\n- **/style** `<description>` — CSS/styling expert mode\n- **/commit** `[message]` — Stage changes and commit\n- **/push** `[remote] [branch]` — Push commits to remote\n- **/review** — Review recent changes for bugs and issues\n- **/learn** — Spend a turn exploring the workspace for better context\n- **/compact** — Compress conversation history\n- **/clear** — Clear chat and start fresh\n- **/export** — Export conversation as JSON\n- **/import** — Import a saved conversation\n- **/git** — Refresh git status\n\n**Skill Management:**\n- **/skill-create** `<name> <description>` — Create a new custom skill\n- **/skill-list** — List all available skills (built-in + custom)\n- **/skill-delete** `<name>` — Delete a custom skill\n\n**Memory (MemPalace):**\n- **/memory** `<query>` — Search past conversations\n- **/memory-status** — Show MemPalace status\n- **/memory-setup** — Install MemPalace (one-time setup)\n\n- **/help** — Show this help';
                 if (skillCommands.length > 0) {
                     helpText += '\n\n**Skills:**';
                     skillCommands.forEach(function(sc) {

@@ -221,12 +221,14 @@ export class ToolPool {
         const backgroundTasks = this._turnState.get('backgroundTasks');
         const worktree = this._turnState.get('worktree');
         const skillManager = this._turnState.get('skillManager');
+        const mempalace = this._turnState.get('mempalace');
         this._turnState.clear();
         if (allTools) { this._turnState.set('allTools', allTools); }
         if (config) { this._turnState.set('config', config); }
         if (backgroundTasks) { this._turnState.set('backgroundTasks', backgroundTasks); }
         if (worktree) { this._turnState.set('worktree', worktree); }
         if (skillManager) { this._turnState.set('skillManager', skillManager); }
+        if (mempalace) { this._turnState.set('mempalace', mempalace); }
     }
 }
 

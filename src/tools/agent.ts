@@ -205,7 +205,62 @@ export const exitPlanModeTool: ToolSpec = defineTool({
     },
 });
 
+// ---------------------------------------------------------------------------
+// #43 — MemPalaceSearch (optional — only works if MemPalace is installed)
+// ---------------------------------------------------------------------------
+
+export const mempalaceSearchTool: ToolSpec = defineTool({
+    name: 'MemPalaceSearch',
+    category: 'agent',
+    description:
+        'Search past conversations stored in MemPalace for relevant context. ' +
+        'Use this when you suspect the user has discussed something before, or when you need ' +
+        'context from a previous session (e.g. past decisions, debugging history, architecture discussions). ' +
+        'Returns verbatim excerpts from past conversations. ' +
+        'This tool only works if MemPalace is installed — if not, it will say so.',
+    parameters: {
+        type: 'object',
+        properties: {
+            query: { type: 'string', description: 'Semantic search query describing what you are looking for.' },
+            wing: { type: 'string', description: 'Optional: limit search to a specific project/wing name.' },
+            max_results: { type: 'number', description: 'Max results to return (default 5).' },
+        },
+        required: ['query'],
+    },
+    requiresConfirmation: false,
+    permissionLevel: 'read',
+
+    async execute(args, ctx) {
+        const mempalace = ctx.turnState.get('mempalace') as
+            { isAvailable: () => Promise<boolean>; search: (q: string, w?: string, n?: number) => Promise<Array<{ text: string; wing?: string; room?: string; date?: string; score?: number }>>; formatResults: (r: Array<{ text: string }>) => string } | undefined;
+
+        if (!mempalace) {
+            return 'MemPalace is not available. The user can install it with `/memory-setup`.';
+        }
+
+        try {
+            const available = await mempalace.isAvailable();
+            if (!available) {
+                return 'MemPalace is not installed. The user can install it with `/memory-setup`.';
+            }
+
+            const query = args.query as string;
+            const wing = args.wing as string | undefined;
+            const maxResults = (args.max_results as number) || 5;
+
+            const results = await mempalace.search(query, wing, maxResults);
+            if (results.length === 0) {
+                return `No memories found for: "${query}"`;
+            }
+
+            return mempalace.formatResults(results);
+        } catch (err: unknown) {
+            return `MemPalace search failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+    },
+});
+
 // EnterPlanMode / ExitPlanMode kept for reference but removed from active pool.
 // Plan/Act switching caused the agent to get stuck — the LLM would enter plan mode
 // and then never proceed to act. Better to let the model plan naturally in its response.
-export const agentTools: ToolSpec[] = [agentTool, skillTool];
+export const agentTools: ToolSpec[] = [agentTool, skillTool, mempalaceSearchTool];

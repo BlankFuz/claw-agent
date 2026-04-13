@@ -7,13 +7,14 @@ import { SessionStore } from "./sessionStore";
 import { SkillManager } from "./skillManager";
 import { MemPalace } from "./mempalace";
 import { compactSession, shouldCompact, estimateSessionTokens, CompactionConfig, DEFAULT_COMPACTION_CONFIG } from "./compact";
+import { invalidatePromptCache } from "./systemPrompt";
 
 const HARNESS_CONFIG = {
     /** No hard turn limit — let the agent run until the task is done. */
     maxTurns: Number.MAX_SAFE_INTEGER,
     /** Message count threshold for silent history trim (raised from 120). */
     compactAfterMessages: 200,
-    defaultThinkingBudget: 10000,
+    defaultThinkingBudget: 32000,
     /** Fraction of model's max context at which to auto-compact. */
     autoCompactRatio: 0.85,
     /** Max chars to store per tool result in history (not just UI). */
@@ -124,6 +125,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         this._lastContinuationHint = null;
         this._sessionStore.clear();
         this._toolPool.resetTurn();
+        invalidatePromptCache();
         if (this._view) {
             this._view.webview.postMessage({ type: 'cleared' });
             this._view.webview.postMessage({ type: 'contextBar', value: { percent: 0, label: '' } });
@@ -641,6 +643,26 @@ Be constructive and specific. Do NOT ask questions — just review.`;
 
                     }
 
+                    // Ensure all tool calls have results — if cancellation or error
+                    // interrupted the loop, push placeholders for any that were skipped.
+                    // Without this, strict providers (e.g. Minimax) reject the next request.
+                    if (response.toolCalls) {
+                        const resultIds = new Set(
+                            this._history
+                                .filter(m => m.role === 'tool' && m.toolCallId)
+                                .map(m => m.toolCallId!)
+                        );
+                        for (const tc of response.toolCalls) {
+                            if (!resultIds.has(tc.id)) {
+                                this._history.push({
+                                    role: 'tool',
+                                    content: '(cancelled — tool was not executed)',
+                                    toolCallId: tc.id,
+                                });
+                            }
+                        }
+                    }
+
                     // Auto-compact if context is getting too large
                     const ctxLimit = this._getContextLimit();
                     const compactThreshold = Math.floor(ctxLimit * HARNESS_CONFIG.autoCompactRatio);
@@ -1076,6 +1098,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
         this._history = result.compactedHistory;
         this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
         this._lastContextTokens = 0;
+        invalidatePromptCache();
 
         webviewView.webview.postMessage({
             type: 'compactDone',
@@ -1098,6 +1121,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
 
         this._history = result.compactedHistory;
         this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
+        invalidatePromptCache();
 
         webviewView.webview.postMessage({
             type: 'compactStatus',

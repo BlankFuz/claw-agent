@@ -101,20 +101,34 @@ async function askOpenAI(opts: AskLLMOptions): Promise<LLMResponse> {
         function: { name: t.name, description: t.description, parameters: t.parameters as unknown as Record<string, unknown> }
     }));
 
-    // Filter orphaned tool results before mapping
-    const validToolIds = new Set<string>();
+    // Bidirectional orphan filtering: every tool_call must have a tool_result and vice versa.
+    // Strict providers (e.g. Minimax) reject messages where pairs are incomplete.
+    const allToolCallIds = new Set<string>();
+    const allToolResultIds = new Set<string>();
     for (const m of messages) {
         if (m.role === 'assistant' && m.toolCalls) {
-            for (const tc of m.toolCalls) { validToolIds.add(tc.id); }
+            for (const tc of m.toolCalls) { allToolCallIds.add(tc.id); }
+        }
+        if (m.role === 'tool' && m.toolCallId) {
+            allToolResultIds.add(m.toolCallId);
         }
     }
-    const cleanMessages = messages.filter(m =>
-        !(m.role === 'tool' && m.toolCallId && !validToolIds.has(m.toolCallId))
-    );
+    const pairedIds = new Set<string>();
+    for (const id of allToolCallIds) {
+        if (allToolResultIds.has(id)) { pairedIds.add(id); }
+    }
+
+    const cleanMessages = messages.filter(m => {
+        // Remove orphaned tool results (no matching tool call)
+        if (m.role === 'tool' && m.toolCallId && !pairedIds.has(m.toolCallId)) {
+            return false;
+        }
+        return true;
+    });
 
     const openaiMessages: OpenAI.ChatCompletionMessageParam[] = [
         { role: 'system', content: systemPrompt },
-        ...cleanMessages.map(mapToOpenAIMessage),
+        ...cleanMessages.map(m => mapToOpenAIMessage(m, pairedIds)),
     ];
 
     // -- Streaming path --
@@ -209,20 +223,26 @@ async function askOpenAI(opts: AskLLMOptions): Promise<LLMResponse> {
     return { text: msg.content || '', usage };
 }
 
-function mapToOpenAIMessage(m: ChatMessage): OpenAI.ChatCompletionMessageParam {
+function mapToOpenAIMessage(m: ChatMessage, pairedIds: Set<string>): OpenAI.ChatCompletionMessageParam {
     if (m.role === 'tool') {
         return { role: 'tool' as const, tool_call_id: m.toolCallId!, content: m.content };
     }
     if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
-        return {
-            role: 'assistant' as const,
-            content: m.content || null,
-            tool_calls: m.toolCalls.map(tc => ({
-                id: tc.id,
-                type: 'function' as const,
-                function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
-            }))
-        };
+        // Strip tool calls whose results are missing (cancelled, compacted away, etc.)
+        const validCalls = m.toolCalls.filter(tc => pairedIds.has(tc.id));
+        if (validCalls.length > 0) {
+            return {
+                role: 'assistant' as const,
+                content: m.content || null,
+                tool_calls: validCalls.map(tc => ({
+                    id: tc.id,
+                    type: 'function' as const,
+                    function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+                }))
+            };
+        }
+        // All tool calls orphaned — send as plain text
+        return { role: 'assistant' as const, content: m.content || '(continued)' };
     }
     // User message with images → multimodal content array
     if (m.role === 'user' && m.images && m.images.length > 0) {
@@ -277,11 +297,11 @@ async function askAnthropic(opts: AskLLMOptions): Promise<LLMResponse> {
     }
 
     if (useThinking) {
-        // Extended thinking mode: use budget, max_tokens must be > budget
+        // Extended thinking mode: generous budget so the model can reason deeply
         baseParams.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
-        baseParams.max_tokens = Math.max(16000, thinkingBudget + 8192);
+        baseParams.max_tokens = Math.max(64000, thinkingBudget + 16384);
     } else {
-        baseParams.max_tokens = 8192;
+        baseParams.max_tokens = 16384;
     }
 
     // -- Streaming path --

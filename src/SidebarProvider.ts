@@ -198,12 +198,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 case "setMode":
                     this._mode = data.value as 'ask' | 'plan' | 'yolo';
                     break;
-                case "executePlan": {
-                    const execMode = data.value as 'yolo' | 'ask';
-                    this._mode = execMode;
-                    this._handleAskAgent(webviewView, "Execute the plan above. Implement all the changes you described.", []);
-                    break;
-                }
+                // executePlan is now handled entirely in webview.js:
+                // it sets the mode via setMode, then sends a regular askAgent message
                 case "saveSettings":
                     this._saveSettings(data.value);
                     break;

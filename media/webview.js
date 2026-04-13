@@ -1061,20 +1061,36 @@ window.addEventListener('message', e => {
             var planActions = document.createElement('div');
             planActions.className = 'plan-approval-actions';
 
+            function executePlan(mode) {
+                approvalDiv.remove();
+                currentMode = mode;
+                updateModeButton();
+                vscode.postMessage({ type: 'setMode', value: mode });
+                setRunning(true);
+                vscode.postMessage({
+                    type: 'askAgent',
+                    value: {
+                        provider: providerSelect.value,
+                        apiKey: apiKeyInput.value,
+                        prompt: 'Execute the plan above. Implement all the changes you described.',
+                        baseUrl: baseUrlInput.value.trim() || undefined,
+                        model: getSelectedModel() || undefined,
+                    }
+                });
+            }
+
             var yoloBtn = document.createElement('button');
             yoloBtn.className = 'plan-btn-yolo';
             yoloBtn.textContent = 'Execute (YOLO)';
             yoloBtn.addEventListener('click', function() {
-                approvalDiv.remove();
-                vscode.postMessage({ type: 'executePlan', value: 'yolo' });
+                executePlan('yolo');
             });
 
             var askBtn2 = document.createElement('button');
             askBtn2.className = 'plan-btn-ask';
             askBtn2.textContent = 'Execute (Ask)';
             askBtn2.addEventListener('click', function() {
-                approvalDiv.remove();
-                vscode.postMessage({ type: 'executePlan', value: 'ask' });
+                executePlan('ask');
             });
 
             var keepBtn = document.createElement('button');

@@ -96,7 +96,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     _skillWatcher: vscode.Disposable | null = null;
     _abortController: AbortController | null = null;
     _thinkingEnabled = true;
-    _autoApprove = false;
+    _mode: 'ask' | 'plan' | 'yolo' = 'ask';
     _lastContextTokens = 0;
     _lastContinuationHint: string | null = null;
     _currentModel: string | undefined;
@@ -195,9 +195,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 case "toggleThinking":
                     this._thinkingEnabled = !!data.value;
                     break;
-                case "toggleAutoApprove":
-                    this._autoApprove = !!data.value;
+                case "setMode":
+                    this._mode = data.value as 'ask' | 'plan' | 'yolo';
                     break;
+                case "executePlan": {
+                    const execMode = data.value as 'yolo' | 'ask';
+                    this._mode = execMode;
+                    this._handleAskAgent(webviewView, "Execute the plan above. Implement all the changes you described.", []);
+                    break;
+                }
                 case "saveSettings":
                     this._saveSettings(data.value);
                     break;
@@ -588,7 +594,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                     apiKey, messages: this._history, baseUrl, model,
                     toolPool: this._toolPool,
                     signal: this._abortController.signal,
-                    planMode: false,
+                    planMode: this._mode === 'plan',
                     thinkingBudget,
                     onStream: (delta) => {
                         webviewView.webview.postMessage({ type: 'streamDelta', value: delta });
@@ -628,7 +634,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                             signal: this._abortController.signal,
                             postMessage,
                             confirmInChat: (toolName, summary) => this._confirmInChat(webviewView, toolName, summary, tc.arguments),
-                            autoApprove: this._autoApprove,
+                            autoApprove: this._mode === 'yolo',
                             preExecute: (_toolName, args) => {
                                 // Snapshot file before write/edit tools modify it
                                 const filePath = args.path || args.file_path || args.filePath;
@@ -705,6 +711,10 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                     }
 
                 } else {
+                    // No more tool calls — if in plan mode, show approval UI
+                    if (this._mode === 'plan') {
+                        webviewView.webview.postMessage({ type: 'planApproval' });
+                    }
                     break;
                 }
             }
@@ -1619,6 +1629,28 @@ body {
 }
 .confirm-deny:hover { opacity: 0.8; }
 
+/* Plan approval */
+.msg-plan-approval {
+  border: 1px solid var(--accent); border-radius: 8px;
+  padding: 12px; margin: 8px 0;
+  background: var(--vscode-menu-background, var(--surface));
+}
+.plan-approval-header {
+  font-weight: 600; margin-bottom: 8px; color: var(--accent);
+}
+.plan-approval-actions {
+  display: flex; gap: 8px; flex-wrap: wrap;
+}
+.plan-approval-actions button {
+  padding: 6px 14px; border-radius: 4px; border: 1px solid var(--border);
+  cursor: pointer; font-size: 12px; font-family: inherit; font-weight: 600;
+}
+.plan-btn-yolo { background: var(--accent); color: var(--surface); border-color: var(--accent); }
+.plan-btn-ask { background: transparent; color: var(--text); }
+.plan-btn-keep { background: transparent; color: var(--text); }
+.plan-btn-yolo:hover { opacity: 0.85; }
+.plan-btn-ask:hover, .plan-btn-keep:hover { background: var(--border); }
+
 /* Thinking */
 .msg-thinking {
   border: 1px solid var(--border); border-radius: var(--radius);
@@ -1931,7 +1963,7 @@ pre code { background: none; padding: 0; border: none; }
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4m0-4h.01"/></svg>
       Think
     </button>
-    <button class="topbar-btn" id="auto-approve-btn" title="Toggle auto-approve tools (YOLO mode)">
+    <button class="topbar-btn" id="auto-approve-btn" title="Mode: Ask / Plan / YOLO (click to cycle)">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
       Ask
     </button>

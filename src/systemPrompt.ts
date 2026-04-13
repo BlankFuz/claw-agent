@@ -43,7 +43,7 @@ export function invalidatePromptCache(): void {
 
 // ── Main builder ────────────────────────────────────────────────────────────
 
-export function buildSystemPrompt(pool?: ToolPool, _planMode?: boolean): string {
+export function buildSystemPrompt(pool?: ToolPool, planMode?: boolean): string {
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
     const sections: string[] = [];
 
@@ -52,6 +52,11 @@ export function buildSystemPrompt(pool?: ToolPool, _planMode?: boolean): string 
     sections.push(getSystemSection());
     sections.push(getDoingTasksSection());
     sections.push(getActionsSection());
+
+    // ── Plan mode preamble (if active) ──
+    if (planMode) {
+        sections.push(getPlanModeSection());
+    }
 
     // ── Dynamic boundary ──
     sections.push('__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__');
@@ -119,6 +124,20 @@ function getDoingTasksSection(): string {
 function getActionsSection(): string {
     return `# Executing actions with care
 Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user or durable workspace instructions.`;
+}
+
+function getPlanModeSection(): string {
+    return `# Plan Mode (ACTIVE)
+You are in Plan Mode — read-only analysis and planning only.
+
+Rules:
+- Explore the codebase using read-only tools (read_file, grep_search, glob_search, list_diagnostics, go_to_definition, find_references, etc.)
+- DO NOT attempt to edit files, run shell commands, or make any changes — those tools are not available in this mode
+- Analyze the user's request thoroughly, then present a structured plan:
+  1. Summary of what needs to change and why
+  2. List of files to modify or create, with specific changes described
+  3. Potential risks or considerations
+- After presenting your plan, stop and wait — the user will choose to approve execution or give feedback`;
 }
 
 // ── Environment context ─────────────────────────────────────────────────────

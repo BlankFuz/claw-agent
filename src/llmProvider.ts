@@ -95,7 +95,14 @@ async function askOpenAI(opts: AskLLMOptions): Promise<LLMResponse> {
 
     const systemPrompt = buildSystemPrompt(toolPool, opts.planMode);
 
-    const toolDefs = (!opts.planMode && toolPool) ? toolPool.toLLMToolDefinitions() : [];
+    const toolDefs = toolPool
+        ? (opts.planMode
+            ? toolPool.toLLMToolDefinitions().filter(t => {
+                  const spec = toolPool.getTool(t.name);
+                  return spec && (spec.permissionLevel === 'read' || spec.permissionLevel === 'network');
+              })
+            : toolPool.toLLMToolDefinitions())
+        : [];
     const openaiTools = toolDefs.map(t => ({
         type: 'function' as const,
         function: { name: t.name, description: t.description, parameters: t.parameters as unknown as Record<string, unknown> }
@@ -272,8 +279,15 @@ async function askAnthropic(opts: AskLLMOptions): Promise<LLMResponse> {
 
     const systemPrompt = buildSystemPrompt(toolPool, planMode);
 
-    // In plan mode, omit tools so the model only reasons
-    const toolDefs = (!planMode && toolPool) ? toolPool.toLLMToolDefinitions() : [];
+    // In plan mode, keep only read-only tools for codebase exploration
+    const toolDefs = toolPool
+        ? (planMode
+            ? toolPool.toLLMToolDefinitions().filter(t => {
+                  const spec = toolPool.getTool(t.name);
+                  return spec && (spec.permissionLevel === 'read' || spec.permissionLevel === 'network');
+              })
+            : toolPool.toLLMToolDefinitions())
+        : [];
     const anthropicTools: Anthropic.Tool[] = toolDefs.map(t => ({
         name: t.name,
         description: t.description,

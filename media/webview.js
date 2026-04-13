@@ -510,15 +510,23 @@ thinkingBtn.addEventListener('click', () => {
     vscode.postMessage({ type: 'toggleThinking', value: thinkingEnabled });
 });
 
-// ── Auto-approve toggle ──
-var autoApproveEnabled = false;
-autoApproveBtn.addEventListener('click', () => {
-    autoApproveEnabled = !autoApproveEnabled;
-    autoApproveBtn.classList.toggle('active', autoApproveEnabled);
-    autoApproveBtn.innerHTML = autoApproveEnabled
-        ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg> YOLO'
-        : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> Ask';
-    vscode.postMessage({ type: 'toggleAutoApprove', value: autoApproveEnabled });
+// ── Mode selector (Ask / Plan / YOLO) ──
+var currentMode = 'ask';
+var modeConfig = {
+    ask:  { icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>', label: 'Ask' },
+    plan: { icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>', label: 'Plan' },
+    yolo: { icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>', label: 'YOLO' }
+};
+function updateModeButton() {
+    autoApproveBtn.innerHTML = modeConfig[currentMode].icon + ' ' + modeConfig[currentMode].label;
+    autoApproveBtn.classList.toggle('active', currentMode !== 'ask');
+}
+autoApproveBtn.addEventListener('click', function() {
+    if (currentMode === 'ask') { currentMode = 'plan'; }
+    else if (currentMode === 'plan') { currentMode = 'yolo'; }
+    else { currentMode = 'ask'; }
+    updateModeButton();
+    vscode.postMessage({ type: 'setMode', value: currentMode });
 });
 
 // ── Settings drawer ──
@@ -1046,6 +1054,45 @@ window.addEventListener('message', e => {
             break;
         }
         case 'usage': usageBar.textContent = msg.value; break;
+        case 'planApproval': {
+            var approvalDiv = document.createElement('div');
+            approvalDiv.className = 'msg msg-plan-approval';
+            approvalDiv.innerHTML = '<div class="plan-approval-header">Plan ready for review</div>';
+            var planActions = document.createElement('div');
+            planActions.className = 'plan-approval-actions';
+
+            var yoloBtn = document.createElement('button');
+            yoloBtn.className = 'plan-btn-yolo';
+            yoloBtn.textContent = 'Execute (YOLO)';
+            yoloBtn.addEventListener('click', function() {
+                approvalDiv.remove();
+                vscode.postMessage({ type: 'executePlan', value: 'yolo' });
+            });
+
+            var askBtn2 = document.createElement('button');
+            askBtn2.className = 'plan-btn-ask';
+            askBtn2.textContent = 'Execute (Ask)';
+            askBtn2.addEventListener('click', function() {
+                approvalDiv.remove();
+                vscode.postMessage({ type: 'executePlan', value: 'ask' });
+            });
+
+            var keepBtn = document.createElement('button');
+            keepBtn.className = 'plan-btn-keep';
+            keepBtn.textContent = 'Keep Planning';
+            keepBtn.addEventListener('click', function() {
+                approvalDiv.remove();
+                input.focus();
+            });
+
+            planActions.appendChild(yoloBtn);
+            planActions.appendChild(askBtn2);
+            planActions.appendChild(keepBtn);
+            approvalDiv.appendChild(planActions);
+            messagesDiv.appendChild(approvalDiv);
+            scrollBottom();
+            break;
+        }
         case 'done':
             setRunning(false);
             if (queuedMessage) {
@@ -1057,6 +1104,8 @@ window.addEventListener('message', e => {
             messagesDiv.innerHTML = '<div class="msg-system" style="padding:20px 0;font-size:11px;color:var(--text-muted);text-align:center;">Chat cleared. Ready.</div>';
             usageBar.textContent = '';
             userMsgCounter = 0;
+            currentMode = 'ask';
+            updateModeButton();
             break;
         case 'loadSettings':
             if (msg.value) {

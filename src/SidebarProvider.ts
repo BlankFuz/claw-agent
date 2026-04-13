@@ -8,6 +8,7 @@ import { SkillManager } from "./skillManager";
 import { MemPalace } from "./mempalace";
 import { compactSession, shouldCompact, estimateSessionTokens, CompactionConfig, DEFAULT_COMPACTION_CONFIG } from "./compact";
 import { invalidatePromptCache } from "./systemPrompt";
+import { CheckpointManager } from "./checkpoint";
 
 const HARNESS_CONFIG = {
     /** No hard turn limit — let the agent run until the task is done. */
@@ -101,6 +102,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     _currentModel: string | undefined;
     _currentProvider: string | undefined;
     _mempalace: MemPalace = new MemPalace();
+    _checkpointMgr: CheckpointManager | null = null;
+    _userMsgCount = 0;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
@@ -125,6 +128,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         this._lastContinuationHint = null;
         this._sessionStore.clear();
         this._toolPool.resetTurn();
+        this._checkpointMgr?.clear();
+        this._userMsgCount = 0;
         invalidatePromptCache();
         if (this._view) {
             this._view.webview.postMessage({ type: 'cleared' });
@@ -214,6 +219,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 case "refreshGit":
                     this._handleRefreshGit(webviewView);
                     break;
+                case "rewindToMessage": {
+                    const rv = data.value as { userMsgIndex: number; action: string };
+                    this._handleRewind(webviewView, rv.userMsgIndex, rv.action as 'code_and_conversation' | 'code_only' | 'conversation_only');
+                    break;
+                }
                 case "fetchModels":
                     this._handleFetchModels(webviewView, data.value as Record<string, string>);
                     break;
@@ -536,6 +546,17 @@ Be constructive and specific. Do NOT ask questions — just review.`;
             }
         }
 
+        // Create checkpoint before the user message is pushed (for rewind)
+        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (wsRoot && !this._checkpointMgr) {
+            this._checkpointMgr = new CheckpointManager(wsRoot);
+            this._checkpointMgr.cleanupOld();
+        }
+        if (this._checkpointMgr) {
+            this._checkpointMgr.createCheckpoint(this._userMsgCount, this._history.length);
+        }
+        this._userMsgCount++;
+
         this._history.push({ role: 'user', content: fullPrompt, ...(images ? { images } : {}) });
         this._toolPool.resetTurn();
         // Make SkillManager available to the Skill tool via turnState
@@ -608,6 +629,13 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                             postMessage,
                             confirmInChat: (toolName, summary) => this._confirmInChat(webviewView, toolName, summary, tc.arguments),
                             autoApprove: this._autoApprove,
+                            preExecute: (_toolName, args) => {
+                                // Snapshot file before write/edit tools modify it
+                                const filePath = args.path || args.file_path || args.filePath;
+                                if (typeof filePath === 'string' && this._checkpointMgr) {
+                                    this._checkpointMgr.snapshotFile(filePath);
+                                }
+                            },
                         });
 
                         // Truncate tool output before storing in history to prevent context bloat.
@@ -704,14 +732,73 @@ Be constructive and specific. Do NOT ask questions — just review.`;
 
     private _replayHistory(webviewView: vscode.WebviewView) {
         if (this._history.length === 0) { return; }
+        let userIdx = 0;
         for (const msg of this._history) {
             if (msg.role === 'user') {
-                webviewView.webview.postMessage({ type: 'addUserMessage', value: msg.content });
+                webviewView.webview.postMessage({
+                    type: 'addUserMessage',
+                    value: msg.content,
+                    userMsgIndex: userIdx,
+                    hasCheckpoint: !!this._checkpointMgr?.get(userIdx),
+                });
+                userIdx++;
             } else if (msg.role === 'assistant' && msg.content) {
                 webviewView.webview.postMessage({ type: 'addResponse', value: msg.content });
             }
         }
         this._postUsage(webviewView);
+    }
+
+    private _handleRewind(
+        webviewView: vscode.WebviewView,
+        userMsgIndex: number,
+        action: 'code_and_conversation' | 'code_only' | 'conversation_only',
+    ) {
+        // 1. Abort running agent if any
+        if (this._abortController) {
+            this._abortController.abort();
+            this._abortController = null;
+        }
+
+        const checkpoint = this._checkpointMgr?.get(userMsgIndex);
+        if (!checkpoint) {
+            webviewView.webview.postMessage({
+                type: 'addResponse',
+                value: 'Cannot rewind: no checkpoint found for this message. Checkpoints are only available for messages sent during this session.',
+            });
+            webviewView.webview.postMessage({ type: 'done' });
+            return;
+        }
+
+        let statusMsg = '';
+
+        // 2. Restore code if requested
+        if (action !== 'conversation_only' && this._checkpointMgr) {
+            const result = this._checkpointMgr.restoreCheckpoint(userMsgIndex);
+            const parts: string[] = [];
+            if (result.restored.length) { parts.push(`restored ${result.restored.length} file(s)`); }
+            if (result.deleted.length) { parts.push(`removed ${result.deleted.length} created file(s)`); }
+            if (result.errors.length) { parts.push(`${result.errors.length} error(s)`); }
+            statusMsg = parts.length ? `Code rewind: ${parts.join(', ')}.` : 'Code rewind: no file changes to undo.';
+        }
+
+        // 3. Restore conversation if requested
+        if (action !== 'code_only') {
+            this._history = this._history.slice(0, checkpoint.historyIndex);
+            this._checkpointMgr?.pruneAfter(userMsgIndex);
+            this._userMsgCount = userMsgIndex;
+            this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
+            invalidatePromptCache();
+        }
+
+        // 4. Rebuild UI
+        webviewView.webview.postMessage({ type: 'cleared' });
+        this._replayHistory(webviewView);
+        if (statusMsg) {
+            webviewView.webview.postMessage({ type: 'addResponse', value: statusMsg });
+        }
+        this._postUsage(webviewView);
+        webviewView.webview.postMessage({ type: 'done' });
     }
 
     private _handleCancel() {
@@ -1371,7 +1458,7 @@ body {
 
 /* User message */
 .msg-user {
-  display: flex; gap: 8px;
+  display: flex; gap: 8px; position: relative;
 }
 .msg-user-avatar {
   width: 24px; height: 24px; border-radius: 50%;
@@ -1384,6 +1471,28 @@ body {
   padding: 8px 12px; max-width: 100%;
   line-height: 1.5; white-space: pre-wrap; word-wrap: break-word;
 }
+.msg-rewind-btn {
+  position: absolute; right: 0; top: 0;
+  background: transparent; color: var(--text-muted);
+  border: 1px solid transparent; border-radius: 4px;
+  font-size: 14px; padding: 2px 6px; cursor: pointer;
+  opacity: 0; transition: opacity 0.15s;
+}
+.msg-user:hover .msg-rewind-btn { opacity: 0.6; }
+.msg-rewind-btn:hover { opacity: 1 !important; background: var(--accent); color: var(--btn-fg); border-color: var(--accent); }
+.rewind-menu {
+  position: absolute; right: 0; top: 28px; z-index: 100;
+  background: var(--vscode-menu-background, var(--surface)); border: 1px solid var(--border);
+  border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  padding: 4px 0; min-width: 200px;
+}
+.rewind-menu-item {
+  display: block; width: 100%; text-align: left;
+  background: transparent; color: var(--vscode-menu-foreground, var(--text)); border: none;
+  padding: 6px 12px; font-size: 12px; cursor: pointer;
+  font-family: inherit;
+}
+.rewind-menu-item:hover { background: var(--accent); color: var(--btn-fg); }
 
 /* Assistant message */
 .msg-assistant {

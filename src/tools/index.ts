@@ -183,9 +183,14 @@ export class ToolPool {
             signal: ctx.signal,
             postMessage: ctx.postMessage,
             turnState: this._turnState,
+            preExecute: ctx.preExecute,
         };
 
         try {
+            // Snapshot files before write tools execute (checkpoint system)
+            if (fullCtx.preExecute && tool.permissionLevel === 'write') {
+                fullCtx.preExecute(name, args);
+            }
             return await tool.execute(args, fullCtx);
         } catch (err: unknown) {
             const message = err instanceof Error ? err.message : String(err);

@@ -82,6 +82,8 @@ export interface ToolContext {
     confirmInChat?: (toolName: string, summary: string, args?: Record<string, unknown>) => Promise<boolean>;
     /** When true, skip all tool confirmation prompts (YOLO mode). */
     autoApprove?: boolean;
+    /** Hook called before file-modifying tools execute. Used by checkpoint system. */
+    preExecute?: (toolName: string, args: Record<string, unknown>) => void;
 }
 
 // ---------------------------------------------------------------------------

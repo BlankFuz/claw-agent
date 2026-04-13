@@ -45,6 +45,7 @@ let isRunning = false;
 let thinkingEnabled = true;
 var queuedMessage = null; // { text, images, files }
 var codeContexts = []; // { filePath, startLine, endLine, lang, code }
+var userMsgCounter = 0;
 
 // ── Slash command autocomplete ──
 const commandDropdown = $('command-dropdown');
@@ -784,9 +785,11 @@ function needsCollapse(rawText) {
 }
 
 // ── Add message helpers ──
-function addUser(text, imageUrls, filePaths) {
+function addUser(text, imageUrls, filePaths, userIdx, hasCheckpoint) {
+    var idx = (userIdx != null) ? userIdx : userMsgCounter;
     var div = document.createElement('div');
     div.className = 'msg msg-user';
+    div.setAttribute('data-user-index', String(idx));
 
     var avatar = document.createElement('div');
     avatar.className = 'msg-user-avatar';
@@ -816,6 +819,18 @@ function addUser(text, imageUrls, filePaths) {
 
     div.appendChild(avatar);
     div.appendChild(body);
+
+    // Rewind button (shown on hover)
+    if (hasCheckpoint !== false) {
+        var rewindBtn = document.createElement('button');
+        rewindBtn.className = 'msg-rewind-btn';
+        rewindBtn.title = 'Rewind to this point';
+        rewindBtn.innerHTML = '&#8617;';
+        rewindBtn.setAttribute('data-user-index', String(idx));
+        div.appendChild(rewindBtn);
+    }
+
+    if (userIdx == null) { userMsgCounter++; }
     messagesDiv.appendChild(div);
     scrollBottom();
 }
@@ -854,7 +869,7 @@ function addThinkingBlock(text) {
 window.addEventListener('message', e => {
     const msg = e.data;
     switch (msg.type) {
-        case 'addUserMessage': addUser(msg.value, null, null); break;
+        case 'addUserMessage': addUser(msg.value, null, null, msg.userMsgIndex, msg.hasCheckpoint); break;
         case 'addResponse': addAssistant(msg.value); break;
         case 'addProgress': {
             const div = document.createElement('div');
@@ -1041,6 +1056,7 @@ window.addEventListener('message', e => {
         case 'cleared':
             messagesDiv.innerHTML = '<div class="msg-system" style="padding:20px 0;font-size:11px;color:var(--text-muted);text-align:center;">Chat cleared. Ready.</div>';
             usageBar.textContent = '';
+            userMsgCounter = 0;
             break;
         case 'loadSettings':
             if (msg.value) {
@@ -1144,6 +1160,44 @@ document.addEventListener('click', function(e) {
         var code = btn.parentElement.querySelector('code');
         if (code) navigator.clipboard.writeText(code.textContent);
     }
+});
+
+// ── Rewind button delegation ──
+function closeRewindMenu() {
+    var old = document.querySelector('.rewind-menu');
+    if (old) { old.remove(); }
+}
+document.addEventListener('click', function(e) {
+    // If clicking inside an open menu, let the menu item handler deal with it
+    if (e.target.closest('.rewind-menu')) { return; }
+    // Close any existing menu when clicking elsewhere
+    closeRewindMenu();
+
+    var btn = e.target.closest('.msg-rewind-btn');
+    if (!btn || isRunning) { return; }
+    e.stopPropagation();
+    var idx = parseInt(btn.getAttribute('data-user-index'), 10);
+
+    // Build inline popup menu
+    var menu = document.createElement('div');
+    menu.className = 'rewind-menu';
+    var options = [
+        { label: 'Restore code & conversation', action: 'code_and_conversation' },
+        { label: 'Restore code only', action: 'code_only' },
+        { label: 'Restore conversation only', action: 'conversation_only' },
+    ];
+    options.forEach(function(opt) {
+        var item = document.createElement('button');
+        item.className = 'rewind-menu-item';
+        item.textContent = opt.label;
+        item.addEventListener('click', function(ev) {
+            ev.stopPropagation();
+            closeRewindMenu();
+            vscode.postMessage({ type: 'rewindToMessage', value: { userMsgIndex: idx, action: opt.action } });
+        });
+        menu.appendChild(item);
+    });
+    btn.parentElement.appendChild(menu);
 });
 
 // ── Export / Import ──

@@ -98,6 +98,44 @@ export class SessionStore {
         this._removeFromSessionList(key);
     }
 
+    /**
+     * Fork the current session at a specific message index.
+     * Creates a new session containing messages[0..atMessageIndex] and saves it
+     * under a unique key. Returns the fork key, or null if nothing to fork.
+     */
+    fork(atMessageIndex: number, messages: ChatMessage[], usage: UsageSummary): string | null {
+        if (atMessageIndex <= 0 || atMessageIndex > messages.length) { return null; }
+
+        const forkedMessages = messages.slice(0, atMessageIndex);
+        if (forkedMessages.length === 0) { return null; }
+
+        // Generate a unique fork key based on timestamp
+        const forkId = `${SESSION_PREFIX}.fork-${Date.now().toString(36)}`;
+        const session: StoredSession = {
+            sessionId: `fork-${Date.now()}`,
+            workspaceName: workspaceName(),
+            messages: forkedMessages.length > MAX_STORED_MESSAGES
+                ? [...forkedMessages.slice(0, 2), ...forkedMessages.slice(-(MAX_STORED_MESSAGES - 2))]
+                : forkedMessages,
+            usage,
+            savedAt: Date.now(),
+        };
+        this.globalState.update(forkId, session);
+        this._updateSessionList(forkId, `${workspaceName()} (fork)`, session.messages.length, session.messages);
+        return forkId;
+    }
+
+    /**
+     * Load a specific session by key (used for loading forks).
+     */
+    loadByKey(key: string): StoredSession | null {
+        const data = this.globalState.get<StoredSession>(key);
+        if (!data || !data.messages || !Array.isArray(data.messages)) {
+            return null;
+        }
+        return data;
+    }
+
     /** List all saved sessions across workspaces. */
     listAll(): SessionSummary[] {
         const list = this.globalState.get<SessionSummary[]>(SESSION_LIST_KEY) || [];

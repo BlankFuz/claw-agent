@@ -495,3 +495,219 @@ function collapseBlankLines(content: string): string {
     }
     return result.join('\n');
 }
+
+// ---------------------------------------------------------------------------
+// Context budget enforcement (Priority 2)
+// ---------------------------------------------------------------------------
+
+/** Reserve tokens for output so we don't fill the entire context window. */
+const OUTPUT_RESERVATION = 16_384;
+/** Safety buffer to avoid edge cases at the exact limit. */
+const BUDGET_BUFFER = 2_000;
+
+/**
+ * Get the effective input context limit, accounting for output reservation.
+ * This is the maximum number of input tokens we should send to the model.
+ */
+export function getEffectiveContextLimit(contextWindowSize: number): number {
+    return Math.max(0, contextWindowSize - OUTPUT_RESERVATION - BUDGET_BUFFER);
+}
+
+/**
+ * Check whether the last known input token count exceeds the safe limit.
+ * Used as a pre-flight check before sending the next request.
+ */
+export function isOverBudget(lastInputTokens: number, contextWindowSize: number): boolean {
+    return lastInputTokens >= getEffectiveContextLimit(contextWindowSize);
+}
+
+// ---------------------------------------------------------------------------
+// Tool result pruning (Priority 4)
+// ---------------------------------------------------------------------------
+
+/** Tokens worth of tool results to protect from pruning (most recent). */
+const PRUNE_PROTECT_TOKENS = 40_000;
+
+/** Stub text for pruned tool results. */
+function pruneStub(originalChars: number): string {
+    return `[Tool output pruned — was ${Math.round(originalChars / 1000)}k chars. Re-run the tool if this context is needed.]`;
+}
+
+/**
+ * Prune older tool results to free context space.
+ *
+ * Walks messages newest → oldest. The most recent tool results (up to
+ * PRUNE_PROTECT_TOKENS) are kept intact. Older tool results are replaced
+ * with a short stub. Tool results whose name appears in `protectedTools`
+ * are never pruned.
+ *
+ * Returns a shallow-copied message array with only the content strings
+ * of pruned messages changed.
+ */
+export function pruneToolResults(
+    messages: ChatMessage[],
+    protectedTools?: Set<string>,
+): ChatMessage[] {
+    // First pass: identify tool result messages and their estimated tokens, newest first
+    const toolResultIndices: number[] = [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'tool') {
+            toolResultIndices.push(i);
+        }
+    }
+
+    if (toolResultIndices.length === 0) { return messages; }
+
+    // Build a map from toolCallId → tool name for protection checks
+    const toolIdToName = new Map<string, string>();
+    if (protectedTools && protectedTools.size > 0) {
+        for (const m of messages) {
+            if (m.role === 'assistant' && m.toolCalls) {
+                for (const tc of m.toolCalls) {
+                    toolIdToName.set(tc.id, tc.name);
+                }
+            }
+        }
+    }
+
+    // Second pass: keep recent tool results, prune older ones
+    let protectedTokens = 0;
+    const indicesToPrune = new Set<number>();
+
+    for (const idx of toolResultIndices) {
+        const msg = messages[idx];
+        const tokens = estimateMessageTokens(msg);
+
+        // Check if this tool is protected by name
+        if (protectedTools && msg.toolCallId) {
+            const toolName = toolIdToName.get(msg.toolCallId);
+            if (toolName && protectedTools.has(toolName)) {
+                continue; // Never prune protected tools
+            }
+        }
+
+        if (protectedTokens < PRUNE_PROTECT_TOKENS) {
+            protectedTokens += tokens;
+            continue; // Within protection window
+        }
+
+        // Only prune if the result is large enough to matter (> 500 chars)
+        if (msg.content.length > 500) {
+            indicesToPrune.add(idx);
+        }
+    }
+
+    if (indicesToPrune.size === 0) { return messages; }
+
+    // Build pruned copy
+    return messages.map((m, i) => {
+        if (indicesToPrune.has(i)) {
+            return { ...m, content: pruneStub(m.content.length) };
+        }
+        return m;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// LLM-based compaction (Priority 3)
+// ---------------------------------------------------------------------------
+
+const LLM_COMPACT_SYSTEM_PROMPT = `You are a conversation summarizer. Your task is to create a detailed, structured summary of the conversation so that a new instance of the assistant can continue seamlessly.
+
+Write the summary in this exact structure:
+
+<summary>
+1. **Primary Request and Intent**: What the user originally asked for and why.
+2. **Key Technical Concepts**: Important technologies, patterns, APIs, or architectural decisions discussed.
+3. **Files and Code Sections**: Specific files modified or discussed, with key details about changes.
+4. **Errors and Fixes**: Any errors encountered and how they were resolved.
+5. **Problem Solving**: Important decisions, trade-offs, or debugging steps taken.
+6. **All User Messages**: Brief summary of every user message to preserve the full conversation arc.
+7. **Pending Tasks**: Any work that was mentioned but not completed.
+8. **Current Work**: What was being actively worked on when this summary was created.
+9. **Optional Next Step**: If the conversation has a natural next action.
+</summary>
+
+Rules:
+- Be specific: include file paths, function names, variable names, line numbers where relevant.
+- Preserve all user instructions and preferences mentioned in the conversation.
+- Include code snippets only when they are essential to understanding (keep them short).
+- If the conversation contains multiple topics, cover all of them.
+- The summary should be detailed enough that the assistant can continue without asking the user to repeat anything.`;
+
+/**
+ * Callback type for LLM calls during compaction.
+ * This avoids circular dependency with llmProvider.
+ */
+export type LLMCompactCallback = (
+    systemPrompt: string,
+    userPrompt: string,
+) => Promise<string>;
+
+/**
+ * LLM-based compaction: uses an LLM to produce a rich structured summary.
+ *
+ * Falls back to deterministic compaction if the LLM call fails.
+ */
+export async function compactSessionWithLLM(
+    messages: ChatMessage[],
+    llmCall: LLMCompactCallback,
+    config: CompactionConfig = DEFAULT_COMPACTION_CONFIG,
+): Promise<CompactionResult> {
+    const start = compactedSummaryPrefixLen(messages);
+    const keep = config.preserveRecentMessages;
+    const cutoff = Math.max(start, messages.length - keep);
+
+    if (cutoff <= start) {
+        return { summary: '', formattedSummary: '', compactedHistory: messages, removedMessageCount: 0 };
+    }
+
+    const messagesToSummarize = messages.slice(start, cutoff);
+    const recentMessages = messages.slice(cutoff);
+
+    // Build a text representation of the conversation for the LLM
+    const conversationText = messagesToSummarize.map(m => {
+        const prefix = m.role === 'user' ? 'User' : m.role === 'assistant' ? 'Assistant' : `Tool(${m.toolCallId || '?'})`;
+        let content = m.content || '';
+        // Truncate very long messages
+        if (content.length > 3000) {
+            content = content.substring(0, 3000) + '\n[...truncated...]';
+        }
+        // Include tool call info
+        if (m.toolCalls && m.toolCalls.length > 0) {
+            const toolNames = m.toolCalls.map(tc => `${tc.name}(${JSON.stringify(tc.arguments).substring(0, 200)})`).join(', ');
+            content += `\n[Tool calls: ${toolNames}]`;
+        }
+        return `### ${prefix}\n${content}`;
+    }).join('\n\n');
+
+    // Check if there was a previous compaction summary
+    let previousContext = '';
+    if (start > 0 && messages[0].role === 'user' && messages[0].content.includes('Summary')) {
+        previousContext = `\n\nNote: This conversation was previously compacted. The earlier summary was:\n${messages[0].content.substring(0, 2000)}`;
+    }
+
+    const userPrompt = `Summarize the following conversation:${previousContext}\n\n---\n\n${conversationText}`;
+
+    try {
+        const llmSummary = await llmCall(LLM_COMPACT_SYSTEM_PROMPT, userPrompt);
+
+        // Extract content from <summary> tags if present
+        const summaryMatch = llmSummary.match(/<summary>([\s\S]*?)<\/summary>/);
+        const summary = summaryMatch ? summaryMatch[1].trim() : llmSummary.trim();
+
+        const formattedSummary = COMPACT_CONTINUATION_PREAMBLE + 'Summary:\n\n' + summary;
+
+        const compactedHistory = getCompactContinuationMessage(formattedSummary, recentMessages);
+
+        return {
+            summary,
+            formattedSummary,
+            compactedHistory,
+            removedMessageCount: messagesToSummarize.length,
+        };
+    } catch (err) {
+        // Re-throw so the caller can decide whether to fall back or show an error
+        throw err;
+    }
+}

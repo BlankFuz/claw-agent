@@ -338,4 +338,72 @@ export const notebookEditTool: ToolSpec = defineTool({
     },
 });
 
-export const fileTools: ToolSpec[] = [readFileTool, writeFileTool, editFileTool, notebookEditTool];
+// ---------------------------------------------------------------------------
+// #14 — multiedit (batch file editing)
+// ---------------------------------------------------------------------------
+
+export const multieditTool: ToolSpec = defineTool({
+    name: 'multiedit',
+    category: 'file',
+    description:
+        'Apply multiple edits to a single file in one operation. Each edit replaces an ' +
+        'exact string with new content, just like edit_file. Edits are applied sequentially ' +
+        'in the order given. Use this instead of calling edit_file multiple times on the same file.',
+    parameters: {
+        type: 'object',
+        properties: {
+            path: { type: 'string', description: 'Relative path to the file to edit.' },
+            edits: {
+                type: 'string',
+                description: 'JSON array of edits. Each edit is an object with "old_string" and "new_string" keys. Example: [{"old_string":"foo","new_string":"bar"},{"old_string":"baz","new_string":"qux"}]',
+            },
+        },
+        required: ['path', 'edits'],
+    },
+    requiresConfirmation: true,
+    permissionLevel: 'write',
+
+    async execute(args, ctx) {
+        const filePath = extractFilePath(args);
+        const uri = safeResolvePath(ctx.workspaceRoot, filePath);
+
+        // Parse edits array
+        let edits: Array<{ old_string: string; new_string: string }>;
+        try {
+            const raw = typeof args.edits === 'string' ? JSON.parse(args.edits) : args.edits;
+            if (!Array.isArray(raw) || raw.length === 0) {
+                return 'Error: edits must be a non-empty JSON array of {old_string, new_string} objects.';
+            }
+            edits = raw;
+        } catch (e) {
+            return `Error parsing edits: ${e instanceof Error ? e.message : String(e)}`;
+        }
+
+        const data = await vscode.workspace.fs.readFile(uri);
+        let content = Buffer.from(data).toString('utf-8');
+
+        const results: string[] = [];
+        for (let i = 0; i < edits.length; i++) {
+            const edit = edits[i];
+            if (!edit.old_string || typeof edit.old_string !== 'string') {
+                results.push(`Edit ${i + 1}: skipped — missing old_string`);
+                continue;
+            }
+            const occurrences = content.split(edit.old_string).length - 1;
+            if (occurrences === 0) {
+                results.push(`Edit ${i + 1}: old_string not found`);
+            } else if (occurrences > 1) {
+                results.push(`Edit ${i + 1}: old_string found ${occurrences} times (must be unique) — skipped`);
+            } else {
+                content = content.replace(edit.old_string, edit.new_string);
+                results.push(`Edit ${i + 1}: applied`);
+            }
+        }
+
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
+        const applied = results.filter(r => r.includes('applied')).length;
+        return `multiedit ${filePath}: ${applied}/${edits.length} edits applied.\n${results.join('\n')}`;
+    },
+});
+
+export const fileTools: ToolSpec[] = [readFileTool, writeFileTool, editFileTool, notebookEditTool, multieditTool];

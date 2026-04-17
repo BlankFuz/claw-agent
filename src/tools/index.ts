@@ -14,6 +14,7 @@
 import * as vscode from 'vscode';
 import { ToolSpec, ToolContext, ToolParametersSchema, PermissionLevel } from './types';
 import { ToolPermissionContext } from '../permissions';
+import { shouldAutoApprove, classifyRisk, RiskLevel } from '../yoloClassifier';
 
 // Import all tool modules
 import { shellTools } from './shell';
@@ -156,8 +157,10 @@ export class ToolPool {
             return `Permission denied: ${denial.reason}`;
         }
 
-        // Confirmation — skip if auto-approve is on, else ask in chat or modal
-        if (tool.requiresConfirmation && !ctx.autoApprove) {
+        // Smart confirmation — use YOLO classifier for risk-based auto-approval
+        const mode = (ctx as Record<string, unknown>).mode as ('ask' | 'plan' | 'yolo') | undefined;
+        const autoApprove = shouldAutoApprove(tool, args, mode || (ctx.autoApprove ? 'yolo' : 'ask'), ctx.workspaceRoot);
+        if (!autoApprove) {
             const summary = this._summarizeArgs(name, args);
             if (ctx.confirmInChat) {
                 const allowed = await ctx.confirmInChat(name, summary, args);

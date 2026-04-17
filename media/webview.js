@@ -28,6 +28,7 @@ const saveSettingsBtn = $('save-settings-btn');
 const contextBar = $('context-bar');
 const contextBarFill = $('context-bar-fill');
 const contextBarLabel = $('context-bar-label');
+const tokenBreakdown = $('token-breakdown');
 const imagePreviews = $('image-previews');
 const fileChips = $('file-chips');
 const mentionDropdown = $('mention-dropdown');
@@ -55,7 +56,7 @@ var SLASH_COMMANDS = [
     { cmd: '/review', desc: 'Review recent changes for issues' },
     { cmd: '/style', desc: 'CSS/styling expert mode', args: '<description>' },
     { cmd: '/learn', desc: 'Explore workspace for deep context' },
-    { cmd: '/compact', desc: 'Compress conversation history' },
+    { cmd: '/compact', desc: 'Compress history (add "llm" for detailed LLM summary)' },
     { cmd: '/clear', desc: 'Clear chat and start fresh' },
     { cmd: '/export', desc: 'Export conversation as JSON' },
     { cmd: '/import', desc: 'Import a saved conversation' },
@@ -502,6 +503,11 @@ function updateQueueHint() {
     }
 }
 
+// ── Token breakdown toggle (click context bar label to expand/collapse) ──
+contextBarLabel.addEventListener('click', function() {
+    tokenBreakdown.classList.toggle('visible');
+});
+
 // ── Thinking toggle ──
 thinkingBtn.classList.add('active');
 thinkingBtn.addEventListener('click', () => {
@@ -859,7 +865,8 @@ function addThinkingBlock(text) {
     const d = document.createElement('details');
     d.className = 'msg msg-thinking';
     const s = document.createElement('summary');
-    s.textContent = 'Thinking';
+    var wordCount = text.split(/\s+/).length;
+    s.innerHTML = '<span class="thinking-icon">&#128161;</span> Thinking <span class="thinking-meta">(' + wordCount + ' words)</span>';
     const c = document.createElement('div');
     c.className = 'thinking-content';
     c.innerHTML = md(text);
@@ -1005,20 +1012,55 @@ window.addEventListener('message', e => {
         }
         case 'compactDone': {
             setRunning(false);
-            // Keep old messages visible — compact only affects the backend context
-            const sysDiv = document.createElement('div');
-            sysDiv.className = 'msg msg-system-cmd';
-            sysDiv.textContent = msg.value;
-            messagesDiv.appendChild(sysDiv);
+            var compactDiv = document.createElement('div');
+            compactDiv.className = 'msg msg-system-cmd';
+
+            // Header line
+            var headerLine = document.createElement('div');
+            headerLine.textContent = msg.value;
+            compactDiv.appendChild(headerLine);
+
+            // Collapsible summary if provided
+            if (msg.summary) {
+                var details = document.createElement('details');
+                details.className = 'compact-summary-details';
+                var summaryEl = document.createElement('summary');
+                summaryEl.textContent = 'View compaction summary';
+                details.appendChild(summaryEl);
+                var contentDiv = document.createElement('div');
+                contentDiv.className = 'compact-summary-content';
+                contentDiv.textContent = msg.summary;
+                details.appendChild(contentDiv);
+                compactDiv.appendChild(details);
+            }
+
+            messagesDiv.appendChild(compactDiv);
             scrollBottom();
             break;
         }
         case 'thinkingDelta':
             if (!thinkingStreamDiv) {
-                thinkingStreamDiv = document.createElement('div');
-                thinkingStreamDiv.className = 'msg thinking-streaming';
-                thinkingStreamDiv.innerHTML = '<div class="spinner"></div> Thinking...';
-                messagesDiv.appendChild(thinkingStreamDiv);
+                thinkingStreamDiv = document.createElement('details');
+                thinkingStreamDiv.className = 'msg msg-thinking';
+                thinkingStreamDiv.setAttribute('open', '');
+                var thinkingSummary = document.createElement('summary');
+                thinkingSummary.innerHTML = '<span class="thinking-icon">&#128161;</span> <div class="spinner" style="display:inline-block;width:10px;height:10px;vertical-align:middle;margin-right:4px;"></div> Thinking...';
+                var thinkingBody = document.createElement('div');
+                thinkingBody.className = 'thinking-content thinking-live';
+                thinkingBody.textContent = '';
+                thinkingStreamDiv.appendChild(thinkingSummary);
+                thinkingStreamDiv.appendChild(thinkingBody);
+                // Insert before streaming div if it exists
+                if (streamingDiv && streamingDiv.parentNode === messagesDiv) {
+                    messagesDiv.insertBefore(thinkingStreamDiv, streamingDiv);
+                } else {
+                    messagesDiv.appendChild(thinkingStreamDiv);
+                }
+            }
+            // Append delta text to the live thinking body
+            var liveBody = thinkingStreamDiv.querySelector('.thinking-content');
+            if (liveBody && msg.value) {
+                liveBody.textContent += msg.value;
             }
             scrollBottom();
             break;
@@ -1054,6 +1096,50 @@ window.addEventListener('message', e => {
             break;
         }
         case 'usage': usageBar.textContent = msg.value; break;
+        case 'tokenBreakdown': {
+            var tb = msg.value;
+            var k = function(n) { return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : '' + n; };
+            var rows = '';
+            // Turn breakdown
+            rows += '<div class="tb-row"><span class="tb-label">Turn input</span><span class="tb-val">' + k(tb.turn.input) + '</span></div>';
+            rows += '<div class="tb-row"><span class="tb-label">Turn output</span><span class="tb-val">' + k(tb.turn.output) + '</span></div>';
+            if (tb.turn.cacheRead > 0) {
+                rows += '<div class="tb-row"><span class="tb-label">Cache read</span><span class="tb-val">' + k(tb.turn.cacheRead) + '</span></div>';
+            }
+            if (tb.turn.cacheWrite > 0) {
+                rows += '<div class="tb-row"><span class="tb-label">Cache write</span><span class="tb-val">' + k(tb.turn.cacheWrite) + '</span></div>';
+            }
+            if (tb.turn.reasoning > 0) {
+                rows += '<div class="tb-row"><span class="tb-label">Reasoning</span><span class="tb-val">' + k(tb.turn.reasoning) + '</span></div>';
+            }
+            // Session totals
+            rows += '<div class="tb-divider"></div>';
+            rows += '<div class="tb-row"><span class="tb-label">Session in/out</span><span class="tb-val">' + k(tb.session.input) + ' / ' + k(tb.session.output) + '</span></div>';
+            if (tb.session.cacheRead > 0) {
+                rows += '<div class="tb-row"><span class="tb-label">Total cached</span><span class="tb-val">' + k(tb.session.cacheRead) + '</span></div>';
+            }
+            if (tb.session.cost > 0) {
+                rows += '<div class="tb-row"><span class="tb-label">Session cost</span><span class="tb-val">$' + (tb.session.cost < 0.01 ? tb.session.cost.toFixed(4) : tb.session.cost.toFixed(2)) + '</span></div>';
+            }
+            rows += '<div class="tb-row"><span class="tb-label">Turns</span><span class="tb-val">' + tb.session.turns + '</span></div>';
+            tokenBreakdown.innerHTML = rows;
+            break;
+        }
+        case 'costAlert': {
+            var ca = msg.value;
+            var alertDiv = document.createElement('div');
+            alertDiv.className = 'msg cost-alert';
+            alertDiv.innerHTML = '<span class="cost-alert-icon">&#9888;</span> Session cost has exceeded <strong>$' +
+                ca.threshold.toFixed(2) + '</strong>. Current total: <strong>$' +
+                (ca.totalCost < 0.01 ? ca.totalCost.toFixed(4) : ca.totalCost.toFixed(2)) +
+                '</strong><button class="cost-alert-dismiss">&times;</button>';
+            alertDiv.querySelector('.cost-alert-dismiss').addEventListener('click', function() {
+                alertDiv.remove();
+            });
+            messagesDiv.appendChild(alertDiv);
+            scrollBottom();
+            break;
+        }
         case 'planApproval': {
             var approvalDiv = document.createElement('div');
             approvalDiv.className = 'msg msg-plan-approval';
@@ -1262,6 +1348,16 @@ document.addEventListener('click', function(e) {
         });
         menu.appendChild(item);
     });
+    // Fork option — branch conversation at this point
+    var forkItem = document.createElement('button');
+    forkItem.className = 'rewind-menu-item rewind-menu-fork';
+    forkItem.textContent = 'Fork conversation here';
+    forkItem.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        closeRewindMenu();
+        vscode.postMessage({ type: 'forkSession', value: idx });
+    });
+    menu.appendChild(forkItem);
     btn.parentElement.appendChild(menu);
 });
 
@@ -1343,6 +1439,7 @@ function send() {
         const cmd = text.split(' ')[0].toLowerCase();
         switch (cmd) {
             case '/compact':
+                var useLLMCompact = text.toLowerCase().includes('llm') || text.toLowerCase().includes('detailed');
                 addUser(text);
                 setRunning(true);
                 vscode.postMessage({
@@ -1352,6 +1449,7 @@ function send() {
                         apiKey: apiKeyInput.value,
                         baseUrl: baseUrlInput.value.trim() || undefined,
                         model: getSelectedModel() || undefined,
+                        llmCompact: useLLMCompact,
                     }
                 });
                 input.value = '';

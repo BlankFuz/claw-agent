@@ -117,6 +117,7 @@ function getDoingTasksSection(): string {
  - Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.
  - Report outcomes faithfully: if verification fails or was not run, say so explicitly.
  - Prefer dedicated tools over shell commands: read_file over cat, edit_file over sed, grep_search over grep, glob_search over find.
+ - When making multiple edits to the same file, use multiedit instead of calling edit_file repeatedly — it batches all changes into one operation.
  - Use list_diagnostics after edits to verify no errors were introduced.
  - When uncertain, investigate (read files, search code) rather than guess.`;
 }

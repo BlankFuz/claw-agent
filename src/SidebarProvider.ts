@@ -6,7 +6,7 @@ import { permissionsFullAccess } from "./permissions";
 import { SessionStore } from "./sessionStore";
 import { SkillManager } from "./skillManager";
 import { MemPalace } from "./mempalace";
-import { compactSession, shouldCompact, estimateSessionTokens, CompactionConfig, DEFAULT_COMPACTION_CONFIG } from "./compact";
+import { compactSession, compactSessionWithLLM, shouldCompact, estimateSessionTokens, CompactionConfig, DEFAULT_COMPACTION_CONFIG, isOverBudget, pruneToolResults } from "./compact";
 import { invalidatePromptCache } from "./systemPrompt";
 import { CheckpointManager } from "./checkpoint";
 
@@ -55,8 +55,8 @@ const MODEL_CONTEXT_LIMITS: Record<string, number> = {
     'meta-llama/llama-4-maverick': 1_000_000,
 };
 
-/** Default context limit when model is unknown. Conservative to avoid 400s. */
-const DEFAULT_CONTEXT_LIMIT = 128_000;
+/** Default context limit when model is unknown. */
+const DEFAULT_CONTEXT_LIMIT = 200_000;
 
 function getContextLimit(model?: string, provider?: string): number {
     if (!model) {
@@ -116,7 +116,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         const saved = this._sessionStore.load();
         if (saved) {
             this._history = saved.messages;
-            this._costTracker.record('restored', saved.usage.inputTokens, saved.usage.outputTokens);
+            this._costTracker.record('restored', saved.usage);
         }
     }
 
@@ -226,6 +226,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                     this._handleRewind(webviewView, rv.userMsgIndex, rv.action as 'code_and_conversation' | 'code_only' | 'conversation_only');
                     break;
                 }
+                case "forkSession": {
+                    const forkIdx = data.value as number;
+                    this._handleForkSession(webviewView, forkIdx);
+                    break;
+                }
                 case "fetchModels":
                     this._handleFetchModels(webviewView, data.value as Record<string, string>);
                     break;
@@ -265,6 +270,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         // Track current model/provider for context limit lookups
         this._currentModel = model;
         this._currentProvider = provider;
+        this._costTracker.setModel(model || '');
 
         // Handle commands that don't need an API key
         if (prompt && prompt.trim() === '/skill-list') {
@@ -585,6 +591,20 @@ Be constructive and specific. Do NOT ask questions — just review.`;
 
                 turnsUsed++;
 
+                // Pre-flight: auto-compact if context is already over budget
+                if (turnsUsed > 1 && this._lastContextTokens > 0) {
+                    const ctxLimit = this._getContextLimit();
+                    if (isOverBudget(this._lastContextTokens, ctxLimit)) {
+                        webviewView.webview.postMessage({
+                            type: 'compactStatus',
+                            value: `Pre-flight compact: context at ${Math.round(this._lastContextTokens / 1000)}k tokens (limit ${Math.round(ctxLimit / 1000)}k)...`,
+                        });
+                        this._structuredCompact(webviewView);
+                        this._lastContextTokens = 0;
+                        this._postContextBar(webviewView);
+                    }
+                }
+
                 const llmOpts: AskLLMOptions = {
                     provider: provider as Provider,
                     apiKey, messages: this._history, baseUrl, model,
@@ -603,10 +623,23 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                 const response = await askLLM(llmOpts);
 
                 if (response.usage) {
-                    this._costTracker.record(`turn-${turnsUsed}`, response.usage.inputTokens, response.usage.outputTokens);
+                    this._costTracker.record(`turn-${turnsUsed}`, response.usage);
                     // Track context size for auto-compact & context bar
                     this._lastContextTokens = response.usage.inputTokens;
                     this._postContextBar(webviewView);
+                    // Send detailed token breakdown to webview
+                    this._postTokenBreakdown(webviewView, response.usage);
+                    // Check cost thresholds
+                    const crossedThreshold = this._costTracker.checkThreshold();
+                    if (crossedThreshold !== null) {
+                        webviewView.webview.postMessage({
+                            type: 'costAlert',
+                            value: {
+                                threshold: crossedThreshold,
+                                totalCost: this._costTracker.totalCost,
+                            },
+                        });
+                    }
                 }
 
                 if (response.thinking) {
@@ -631,6 +664,7 @@ Be constructive and specific. Do NOT ask questions — just review.`;
                             postMessage,
                             confirmInChat: (toolName, summary) => this._confirmInChat(webviewView, toolName, summary, tc.arguments),
                             autoApprove: this._mode === 'yolo',
+                            mode: this._mode,
                             preExecute: (_toolName, args) => {
                                 // Snapshot file before write/edit tools modify it
                                 const filePath = args.path || args.file_path || args.filePath;
@@ -727,8 +761,25 @@ Be constructive and specific. Do NOT ask questions — just review.`;
 
         } catch (err: unknown) {
             const message = err instanceof Error ? err.message : String(err);
-            webviewView.webview.postMessage({ type: 'streamEnd' });
-            webviewView.webview.postMessage({ type: 'addResponse', value: `Error: ${message}` });
+            // Only match genuine context overflow errors — be specific to avoid false positives
+            const isContextOverflow = /context[_ ]length[_ ]exceeded|prompt is too long|input is too long|maximum context length/i.test(message);
+            if (isContextOverflow && this._history.length > 4) {
+                // Auto-compact and notify user
+                webviewView.webview.postMessage({ type: 'streamEnd' });
+                webviewView.webview.postMessage({
+                    type: 'compactStatus',
+                    value: 'Context overflow detected — auto-compacting...',
+                });
+                this._structuredCompact(webviewView);
+                this._lastContextTokens = 0;
+                webviewView.webview.postMessage({
+                    type: 'addResponse',
+                    value: '⚠ Context limit exceeded. History was compacted automatically. Please re-send your last message.',
+                });
+            } else {
+                webviewView.webview.postMessage({ type: 'streamEnd' });
+                webviewView.webview.postMessage({ type: 'addResponse', value: `Error: ${message}` });
+            }
         } finally {
             this._abortController = null;
             this._postUsage(webviewView);
@@ -814,6 +865,62 @@ Be constructive and specific. Do NOT ask questions — just review.`;
             this._pendingConfirmResolve(false);
             this._pendingConfirmResolve = null;
         }
+    }
+
+    private _handleForkSession(webviewView: vscode.WebviewView, userMsgIndex: number) {
+        // Find the history index corresponding to this user message index
+        let targetHistoryIndex = 0;
+        let userCount = 0;
+        for (let i = 0; i < this._history.length; i++) {
+            if (this._history[i].role === 'user') {
+                if (userCount === userMsgIndex) {
+                    targetHistoryIndex = i;
+                    break;
+                }
+                userCount++;
+            }
+        }
+
+        // Save current session first
+        this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
+
+        // Fork: create new session with messages up to (and including) this user message
+        const forkKey = this._sessionStore.fork(
+            targetHistoryIndex + 1,
+            this._history,
+            this._costTracker.totalUsage,
+        );
+
+        if (!forkKey) {
+            webviewView.webview.postMessage({
+                type: 'addResponse',
+                value: 'Cannot fork: invalid message index.',
+            });
+            webviewView.webview.postMessage({ type: 'done' });
+            return;
+        }
+
+        // Load the forked session as current
+        const forked = this._sessionStore.loadByKey(forkKey);
+        if (forked) {
+            this._history = forked.messages;
+            this._costTracker.reset();
+            this._costTracker.record('fork-base', forked.usage);
+            this._lastContextTokens = 0;
+            this._userMsgCount = forked.messages.filter(m => m.role === 'user').length;
+            this._checkpointMgr?.clear();
+            invalidatePromptCache();
+
+            // Rebuild UI
+            webviewView.webview.postMessage({ type: 'cleared' });
+            this._replayHistory(webviewView);
+            webviewView.webview.postMessage({
+                type: 'addResponse',
+                value: `Forked conversation at message ${userMsgIndex + 1}. You can continue from this point independently.`,
+            });
+            this._postUsage(webviewView);
+        }
+        webviewView.webview.postMessage({ type: 'done' });
     }
 
     // ── Inline confirmation ────────────────────────────────────────────────
@@ -1020,7 +1127,13 @@ Be constructive and specific. Do NOT ask questions — just review.`;
             this._history = json.messages as ChatMessage[];
             this._costTracker.reset();
             if (json.usage) {
-                this._costTracker.record('imported', json.usage.inputTokens || 0, json.usage.outputTokens || 0);
+                this._costTracker.record('imported', {
+                    inputTokens: json.usage.inputTokens || 0,
+                    outputTokens: json.usage.outputTokens || 0,
+                    cacheReadTokens: json.usage.cacheReadTokens || 0,
+                    cacheWriteTokens: json.usage.cacheWriteTokens || 0,
+                    reasoningTokens: json.usage.reasoningTokens || 0,
+                });
             }
             this._sessionStore.save('default', this._history, this._costTracker.totalUsage);
             // Refresh the webview
@@ -1163,17 +1276,26 @@ Be constructive and specific. Do NOT ask questions — just review.`;
      * timeline) without requiring an LLM call. Previous summaries are
      * merged so context accumulates across multiple compactions.
      */
-    private async _handleCompact(webviewView: vscode.WebviewView, _settings?: Record<string, unknown>) {
+    private async _handleCompact(webviewView: vscode.WebviewView, settings?: Record<string, unknown>) {
         const before = this._history.length;
         if (before <= 4) {
             webviewView.webview.postMessage({ type: 'compactDone', value: `Nothing to compact (history has ${before} messages).` });
             return;
         }
 
-        webviewView.webview.postMessage({ type: 'compactStatus', value: 'Compacting conversation...' });
+        const useLLM = !!settings?.llmCompact;
+
+        webviewView.webview.postMessage({
+            type: 'compactStatus',
+            value: useLLM ? 'Compacting with LLM summarization...' : 'Compacting conversation...',
+        });
 
         // Save full conversation to MemPalace before compacting (if available)
         this._mempalaceSaveConversation(webviewView);
+
+        // Prune old tool results first
+        const protectedTools = new Set(['Skill', 'Agent']);
+        this._history = pruneToolResults(this._history, protectedTools);
 
         // Use structured compaction with generous recent-message preservation
         const config: CompactionConfig = {
@@ -1181,7 +1303,51 @@ Be constructive and specific. Do NOT ask questions — just review.`;
             maxEstimatedTokens: 1, // Always compact when explicitly requested
         };
 
-        const result = compactSession(this._history, config);
+        let result;
+        if (useLLM) {
+            // Use credentials from the compact message (sent by webview)
+            const apiKey = settings?.apiKey as string | undefined;
+            const provider = settings?.provider as string | undefined;
+            const baseUrl = settings?.baseUrl as string | undefined;
+            const model = settings?.model as string | undefined;
+
+            if (apiKey && provider) {
+                try {
+                    result = await compactSessionWithLLM(
+                        this._history,
+                        async (_systemPrompt, userPrompt) => {
+                            const resp = await askLLM({
+                                provider: provider as Provider,
+                                apiKey,
+                                baseUrl,
+                                model,
+                                messages: [
+                                    { role: 'user', content: _systemPrompt + '\n\n' + userPrompt },
+                                ],
+                                planMode: true, // No tools needed
+                            });
+                            return resp.text || '';
+                        },
+                        config,
+                    );
+                } catch (err: unknown) {
+                    const errMsg = err instanceof Error ? err.message : String(err);
+                    webviewView.webview.postMessage({
+                        type: 'compactStatus',
+                        value: `LLM compact failed (${errMsg}), falling back to fast compact...`,
+                    });
+                    result = compactSession(this._history, config);
+                }
+            } else {
+                webviewView.webview.postMessage({
+                    type: 'compactStatus',
+                    value: 'No API key found — using fast compact instead.',
+                });
+                result = compactSession(this._history, config);
+            }
+        } else {
+            result = compactSession(this._history, config);
+        }
 
         if (result.removedMessageCount === 0) {
             webviewView.webview.postMessage({ type: 'compactDone', value: `Nothing to compact (history has ${before} messages).` });
@@ -1193,9 +1359,11 @@ Be constructive and specific. Do NOT ask questions — just review.`;
         this._lastContextTokens = 0;
         invalidatePromptCache();
 
+        const method = useLLM ? 'LLM-summarized' : 'Compacted';
         webviewView.webview.postMessage({
             type: 'compactDone',
-            value: `Compacted: ${result.removedMessageCount} messages summarized, ${this._history.length} kept.`,
+            value: `${method}: ${result.removedMessageCount} messages summarized, ${this._history.length} kept.`,
+            summary: result.summary,
         });
         this._postUsage(webviewView);
         this._postContextBar(webviewView);
@@ -1209,6 +1377,10 @@ Be constructive and specific. Do NOT ask questions — just review.`;
         // Save to MemPalace before compacting
         this._mempalaceSaveConversation(webviewView);
 
+        // Prune large old tool results before compaction to free context
+        const protectedTools = new Set(['Skill', 'Agent']);
+        this._history = pruneToolResults(this._history, protectedTools);
+
         const result = compactSession(this._history, DEFAULT_COMPACTION_CONFIG);
         if (result.removedMessageCount === 0) { return; }
 
@@ -1217,8 +1389,9 @@ Be constructive and specific. Do NOT ask questions — just review.`;
         invalidatePromptCache();
 
         webviewView.webview.postMessage({
-            type: 'compactStatus',
+            type: 'compactDone',
             value: `Auto-compacted: ${result.removedMessageCount} messages summarized.`,
+            summary: result.summary,
         });
     }
 
@@ -1239,11 +1412,42 @@ Be constructive and specific. Do NOT ask questions — just review.`;
             (this._lastContextTokens / limit) * 100
         ));
         const k = (n: number) => n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`;
+        let label = `${k(this._lastContextTokens)} / ${k(limit)} tokens`;
+        const cost = this._costTracker.totalCost;
+        if (cost > 0) {
+            label += ` · $${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(2)}`;
+        }
         webviewView.webview.postMessage({
             type: 'contextBar',
             value: {
                 percent: pct,
-                label: `${k(this._lastContextTokens)} / ${k(limit)} tokens`,
+                label,
+            },
+        });
+    }
+
+    /** Send detailed token breakdown for the current turn + session totals. */
+    private _postTokenBreakdown(webviewView: vscode.WebviewView, turnUsage: import('./costTracker').UsageSummary): void {
+        const total = this._costTracker.totalUsage;
+        webviewView.webview.postMessage({
+            type: 'tokenBreakdown',
+            value: {
+                turn: {
+                    input: turnUsage.inputTokens,
+                    output: turnUsage.outputTokens,
+                    cacheRead: turnUsage.cacheReadTokens,
+                    cacheWrite: turnUsage.cacheWriteTokens,
+                    reasoning: turnUsage.reasoningTokens,
+                },
+                session: {
+                    input: total.inputTokens,
+                    output: total.outputTokens,
+                    cacheRead: total.cacheReadTokens,
+                    cacheWrite: total.cacheWriteTokens,
+                    reasoning: total.reasoningTokens,
+                    cost: this._costTracker.totalCost,
+                    turns: this._costTracker.turnCount,
+                },
             },
         });
     }
@@ -1285,10 +1489,11 @@ Be constructive and specific. Do NOT ask questions — just review.`;
         this._mempalace.isAvailable().then(available => {
             if (!available) { return; }
             const wsName = vscode.workspace.workspaceFolders?.[0]?.name;
-            this._mempalace.saveConversation(this._history, wsName).then(result => {
+            // Use structured extraction + raw save
+            this._mempalace.extractAndSave(this._history, wsName).then(() => {
                 webviewView.webview.postMessage({
                     type: 'compactStatus',
-                    value: `Memory saved to MemPalace.`,
+                    value: `Memory saved to MemPalace (structured + raw).`,
                 });
             }).catch(() => { /* silent fail — mempalace is optional */ });
         }).catch(() => { /* silent fail */ });
@@ -1499,6 +1704,10 @@ body {
   font-family: inherit;
 }
 .rewind-menu-item:hover { background: var(--accent); color: var(--btn-fg); }
+.rewind-menu-fork {
+  border-top: 1px solid var(--border); margin-top: 2px; padding-top: 8px;
+  color: var(--vscode-terminal-ansiCyan, #89d4cf);
+}
 
 /* Assistant message */
 .msg-assistant {
@@ -1592,6 +1801,23 @@ body {
   font-size: 11px; color: var(--accent); padding: 4px 0;
   font-family: var(--mono); font-style: italic;
 }
+.compact-summary-details {
+  margin-top: 6px; font-style: normal;
+}
+.compact-summary-details summary {
+  cursor: pointer; font-size: 10px; color: var(--text-muted);
+  user-select: none;
+}
+.compact-summary-details summary:hover { color: var(--text); }
+.compact-summary-content {
+  margin-top: 4px; padding: 8px;
+  background: var(--vscode-menu-background, var(--surface));
+  border: 1px solid var(--border); border-radius: 4px;
+  font-size: 11px; color: var(--text);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 400px; overflow-y: auto;
+  line-height: 1.5;
+}
 
 /* Inline tool confirmation */
 .msg-confirm {
@@ -1669,15 +1895,31 @@ body {
   color: var(--text-muted); line-height: 1.5;
   border-top: 1px solid var(--border);
 }
-.thinking-streaming {
-  display: flex; align-items: center; gap: 6px;
-  font-size: 11px; color: var(--text-muted); padding: 4px 0;
+.thinking-live {
+  font-style: italic; color: var(--text-muted); opacity: 0.8;
+  max-height: 200px;
 }
-.thinking-streaming .spinner {
-  width: 10px; height: 10px; border: 1.5px solid var(--border);
-  border-top-color: var(--text-muted); border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+.thinking-meta {
+  font-weight: normal; opacity: 0.6; font-size: 10px;
 }
+.thinking-icon {
+  font-size: 12px;
+}
+
+/* Cost alert */
+.cost-alert {
+  background: rgba(255, 180, 0, 0.12); border: 1px solid rgba(255, 180, 0, 0.3);
+  border-radius: var(--radius); padding: 8px 12px; font-size: 12px;
+  color: var(--text); display: flex; align-items: center; gap: 6px;
+  position: relative;
+}
+.cost-alert-icon { font-size: 16px; }
+.cost-alert-dismiss {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; color: var(--text-muted); cursor: pointer;
+  font-size: 16px; padding: 0 4px; line-height: 1;
+}
+.cost-alert-dismiss:hover { color: var(--text); }
 
 /* System */
 .msg-system {
@@ -1899,6 +2141,20 @@ pre code { background: none; padding: 0; border: none; }
 .context-bar-label {
   font-size: 9px; color: var(--text-muted);
   text-align: right; margin-top: 1px;
+  cursor: pointer;
+}
+.token-breakdown {
+  display: none; font-size: 9px; color: var(--text-muted);
+  padding: 3px 0; line-height: 1.5;
+}
+.token-breakdown.visible { display: block; }
+.token-breakdown .tb-row {
+  display: flex; justify-content: space-between;
+}
+.token-breakdown .tb-label { opacity: 0.7; }
+.token-breakdown .tb-val { font-variant-numeric: tabular-nums; }
+.token-breakdown .tb-divider {
+  border-top: 1px solid var(--border); margin: 2px 0;
 }
 
 /* ── Usage bar ── */
@@ -2017,6 +2273,7 @@ pre code { background: none; padding: 0; border: none; }
       <div class="context-bar-fill" id="context-bar-fill"></div>
     </div>
     <div class="context-bar-label" id="context-bar-label"></div>
+    <div class="token-breakdown" id="token-breakdown"></div>
   </div>
 
   <!-- Usage -->

@@ -2,7 +2,7 @@ import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { ToolPool } from './tools/index';
 import { buildSystemPrompt } from './systemPrompt';
-import { UsageSummary } from './costTracker';
+import { UsageSummary, emptyUsage } from './costTracker';
 
 export type Provider = 'OpenAI' | 'OpenRouter' | 'Anthropic' | 'Local';
 
@@ -150,7 +150,7 @@ async function askOpenAI(opts: AskLLMOptions): Promise<LLMResponse> {
 
         let text = '';
         const toolCallsMap: Map<number, { id: string; name: string; args: string }> = new Map();
-        let usage: UsageSummary = { inputTokens: 0, outputTokens: 0 };
+        let usage: UsageSummary = emptyUsage();
 
         for await (const chunk of stream) {
             if (signal?.aborted) { break; }
@@ -180,7 +180,16 @@ async function askOpenAI(opts: AskLLMOptions): Promise<LLMResponse> {
             }
 
             if (chunk.usage) {
-                usage = { inputTokens: chunk.usage.prompt_tokens || 0, outputTokens: chunk.usage.completion_tokens || 0 };
+                const details = (chunk.usage as Record<string, unknown>).prompt_tokens_details as Record<string, number> | undefined;
+                usage = {
+                    inputTokens: chunk.usage.prompt_tokens || 0,
+                    outputTokens: chunk.usage.completion_tokens || 0,
+                    cacheReadTokens: details?.cached_tokens || 0,
+                    cacheWriteTokens: 0,
+                    reasoningTokens: (chunk.usage as Record<string, unknown>).completion_tokens_details
+                        ? ((chunk.usage as Record<string, unknown>).completion_tokens_details as Record<string, number>)?.reasoning_tokens || 0
+                        : 0,
+                };
             }
         }
 
@@ -208,9 +217,14 @@ async function askOpenAI(opts: AskLLMOptions): Promise<LLMResponse> {
         throw new Error('No response returned from the API');
     }
 
+    const oaiDetails = (response.usage as Record<string, unknown> | undefined)?.prompt_tokens_details as Record<string, number> | undefined;
+    const oaiCompDetails = (response.usage as Record<string, unknown> | undefined)?.completion_tokens_details as Record<string, number> | undefined;
     const usage: UsageSummary = {
         inputTokens: response.usage?.prompt_tokens || 0,
         outputTokens: response.usage?.completion_tokens || 0,
+        cacheReadTokens: oaiDetails?.cached_tokens || 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: oaiCompDetails?.reasoning_tokens || 0,
     };
 
     const msg = firstChoice.message;
@@ -328,7 +342,7 @@ async function askAnthropic(opts: AskLLMOptions): Promise<LLMResponse> {
         let currentToolId = '';
         let currentToolName = '';
         let currentToolInput = '';
-        let usage: UsageSummary = { inputTokens: 0, outputTokens: 0 };
+        let usage: UsageSummary = emptyUsage();
 
         // Use streamEvent for correct ordering — content_block_start fires
         // BEFORE input_json_delta, so we can set up the tool ID first.
@@ -407,9 +421,13 @@ async function askAnthropic(opts: AskLLMOptions): Promise<LLMResponse> {
             }
         }
 
+        const anthUsage = finalMessage.usage as Record<string, number> | undefined;
         usage = {
-            inputTokens: finalMessage.usage?.input_tokens || 0,
-            outputTokens: finalMessage.usage?.output_tokens || 0,
+            inputTokens: anthUsage?.input_tokens || 0,
+            outputTokens: anthUsage?.output_tokens || 0,
+            cacheReadTokens: anthUsage?.cache_read_input_tokens || 0,
+            cacheWriteTokens: anthUsage?.cache_creation_input_tokens || 0,
+            reasoningTokens: 0,
         };
 
         return {
@@ -423,9 +441,13 @@ async function askAnthropic(opts: AskLLMOptions): Promise<LLMResponse> {
     // -- Non-streaming path --
     const response = await anthropic.messages.create(baseParams as unknown as Anthropic.MessageCreateParams) as Anthropic.Message;
 
+    const anthNsUsage = response.usage as Record<string, number> | undefined;
     const usage: UsageSummary = {
-        inputTokens: response.usage?.input_tokens || 0,
-        outputTokens: response.usage?.output_tokens || 0,
+        inputTokens: anthNsUsage?.input_tokens || 0,
+        outputTokens: anthNsUsage?.output_tokens || 0,
+        cacheReadTokens: anthNsUsage?.cache_read_input_tokens || 0,
+        cacheWriteTokens: anthNsUsage?.cache_creation_input_tokens || 0,
+        reasoningTokens: 0,
     };
 
     const toolUses = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use');

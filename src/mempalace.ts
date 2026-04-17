@@ -213,6 +213,123 @@ export class MemPalace {
     }
 
     /**
+     * Extract structured facts from a conversation and save to MemPalace.
+     *
+     * Unlike saveConversation() which dumps raw text, this extracts:
+     *   - Key files modified or discussed
+     *   - Decisions made and their rationale
+     *   - Errors encountered and fixes applied
+     *   - User preferences or instructions
+     *
+     * Uses keyword-based extraction (no LLM call) for speed.
+     */
+    async extractAndSave(
+        messages: Array<{ role: string; content: string; toolCalls?: Array<{ name: string; arguments: Record<string, unknown> }> }>,
+        workspaceName?: string,
+    ): Promise<string> {
+        if (!await this.isAvailable()) { return ''; }
+        if (messages.length === 0) { return 'No messages to extract from.'; }
+
+        const facts: string[] = [];
+        const filesModified = new Set<string>();
+        const toolsUsed = new Set<string>();
+        const errors: string[] = [];
+        const decisions: string[] = [];
+        const userInstructions: string[] = [];
+
+        for (const msg of messages) {
+            const content = msg.content || '';
+
+            // Extract tool usage
+            if (msg.toolCalls) {
+                for (const tc of msg.toolCalls) {
+                    toolsUsed.add(tc.name);
+                    // Track file paths from file-modifying tools
+                    const filePath = tc.arguments?.file_path || tc.arguments?.path || tc.arguments?.filePath;
+                    if (filePath && typeof filePath === 'string' && (tc.name === 'edit_file' || tc.name === 'write_file')) {
+                        filesModified.add(filePath);
+                    }
+                }
+            }
+
+            // Extract file paths mentioned in content
+            const fileMatches = content.match(/(?:[\w./\\-]+\.(?:ts|js|py|rs|go|java|tsx|jsx|css|html|json|md|yaml|yml|toml))/g);
+            if (fileMatches) {
+                for (const f of fileMatches.slice(0, 20)) { filesModified.add(f); }
+            }
+
+            // Extract errors from assistant messages
+            if (msg.role === 'assistant' && /error|exception|failed|bug|fix/i.test(content)) {
+                const errorLine = content.split('\n').find(l => /error|exception|failed/i.test(l));
+                if (errorLine && errorLine.length < 200) {
+                    errors.push(errorLine.trim());
+                }
+            }
+
+            // Extract user preferences/decisions
+            if (msg.role === 'user') {
+                if (/prefer|always|never|don't|instead|use.*instead/i.test(content) && content.length < 300) {
+                    userInstructions.push(content.trim());
+                }
+                if (/decided|decision|let's go with|approach/i.test(content) && content.length < 300) {
+                    decisions.push(content.trim());
+                }
+            }
+        }
+
+        // Build structured output
+        const date = new Date().toISOString().split('T')[0];
+        facts.push(`## Session Facts (${date})`);
+        if (workspaceName) { facts.push(`Workspace: ${workspaceName}`); }
+
+        if (filesModified.size > 0) {
+            const files = Array.from(filesModified).slice(0, 15);
+            facts.push(`\nFiles involved: ${files.join(', ')}`);
+        }
+        if (toolsUsed.size > 0) {
+            facts.push(`Tools used: ${Array.from(toolsUsed).join(', ')}`);
+        }
+        if (errors.length > 0) {
+            facts.push(`\nErrors encountered:`);
+            for (const e of errors.slice(0, 5)) { facts.push(`- ${e}`); }
+        }
+        if (decisions.length > 0) {
+            facts.push(`\nDecisions:`);
+            for (const d of decisions.slice(0, 5)) { facts.push(`- ${d}`); }
+        }
+        if (userInstructions.length > 0) {
+            facts.push(`\nUser preferences:`);
+            for (const u of userInstructions.slice(0, 5)) { facts.push(`- ${u}`); }
+        }
+
+        // Also do the raw save for full context
+        const rawResult = await this.saveConversation(messages, workspaceName);
+
+        // Save structured facts as a separate document
+        if (facts.length > 2) {
+            const tmpDir = path.join(os.tmpdir(), `claw-mempalace-facts-${Date.now()}`);
+            const tmpFile = path.join(tmpDir, 'session-facts.txt');
+            try {
+                fs.mkdirSync(tmpDir, { recursive: true });
+                fs.writeFileSync(tmpFile, facts.join('\n'), 'utf-8');
+
+                const mineArgs = ['-m', 'mempalace', 'mine', tmpDir, '--mode', 'notes'];
+                if (workspaceName) {
+                    mineArgs.push('--wing', workspaceName.replace(/[^a-zA-Z0-9_-]/g, '_'));
+                }
+                await safeExec(this._pythonCmd, mineArgs, { timeout: 30000, maxBuffer: 1024 * 1024 });
+            } catch {
+                // Non-critical — raw save already succeeded
+            } finally {
+                try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+                try { fs.rmdirSync(tmpDir); } catch { /* ignore */ }
+            }
+        }
+
+        return rawResult;
+    }
+
+    /**
      * Install mempalace via pip.
      * Returns progress messages via callback.
      */

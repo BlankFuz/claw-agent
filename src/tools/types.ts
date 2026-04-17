@@ -80,8 +80,10 @@ export interface ToolContext {
     turnState: Map<string, unknown>;
     /** Inline confirmation callback — asks the user in the chat webview. */
     confirmInChat?: (toolName: string, summary: string, args?: Record<string, unknown>) => Promise<boolean>;
-    /** When true, skip all tool confirmation prompts (YOLO mode). */
+    /** When true, skip all tool confirmation prompts (legacy YOLO mode). */
     autoApprove?: boolean;
+    /** Current agent mode — used by smart YOLO classifier for risk-based approval. */
+    mode?: 'ask' | 'plan' | 'yolo';
     /** Hook called before file-modifying tools execute. Used by checkpoint system. */
     preExecute?: (toolName: string, args: Record<string, unknown>) => void;
 }
@@ -111,6 +113,9 @@ export interface ToolSpec {
 
     /** Whether this tool is only available on certain platforms. */
     platforms?: NodeJS.Platform[];
+
+    /** If true, this tool's results are protected from pruning during compaction. */
+    protected?: boolean;
 
     /**
      * Execute the tool and return a string result that is fed back to the LLM
